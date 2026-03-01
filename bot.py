@@ -48,6 +48,7 @@ def log_alert(db, opportunity):
         "yes_price_at_alert": opportunity["yes_price"],
         "score": opportunity["score"],
         "reason": opportunity["reason"],
+        "volume_at_alert": opportunity["volume"],
         "alerted_at": datetime.now(timezone.utc).isoformat(),
         "outcome": None,
         "profitable": None
@@ -121,36 +122,38 @@ async def send_daily_summary(db):
 
 async def fetch_all_markets():
     all_markets = []
-    next_cursor = None
-    page = 0
+    offset = 0
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Origin": "https://polymarket.com",
-        "Referer": "https://polymarket.com/"
+        "Accept": "application/json"
     }
     async with aiohttp.ClientSession() as session:
-        while page < CONFIG["max_pages"]:
-            url = "https://clob.polymarket.com/markets?active=true&closed=false&limit=" + str(CONFIG["markets_per_page"])
-            if next_cursor:
-                url = url + "&next_cursor=" + next_cursor
+        while offset < CONFIG["max_pages"] * CONFIG["markets_per_page"]:
+            url = (
+                "https://gamma-api.polymarket.com/markets"
+                "?active=true&closed=false"
+                "&limit=" + str(CONFIG["markets_per_page"])
+                + "&offset=" + str(offset)
+                + "&order=volume24hr&ascending=false"
+            )
             try:
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        markets = data.get("data", [])
-                        all_markets.extend(markets)
-                        next_cursor = data.get("next_cursor")
-                        page += 1
-                        log.info("Page %d: %d markets (total: %d)", page, len(markets), len(all_markets))
-                        if not next_cursor or not markets:
+                        markets = await resp.json()
+                        if not markets:
                             break
+                        all_markets.extend(markets)
+                        page = offset // CONFIG["markets_per_page"] + 1
+                        log.info("Page %d: %d markets (total: %d)", page, len(markets), len(all_markets))
+                        if len(markets) < CONFIG["markets_per_page"]:
+                            break
+                        offset += CONFIG["markets_per_page"]
                         await asyncio.sleep(0.5)
                     else:
                         log.error("API error: %d", resp.status)
                         break
             except Exception as e:
-                log.error("Error on page %d: %s", page, e)
+                log.error("Error fetching markets: %s", e)
                 break
     return all_markets
 
@@ -160,13 +163,17 @@ def is_market_active(market):
             return False
         if not market.get("active", False):
             return False
-        if not market.get("accepting_orders", False):
+        outcomes = market.get("outcomePrices", "[]")
+        if isinstance(outcomes, str):
+            import json as j
+            outcomes = j.loads(outcomes)
+        if not outcomes:
             return False
-        tokens = market.get("tokens", [])
-        if not tokens:
-            return False
-        yes_price = float(tokens[0].get("price", 0.5))
+        yes_price = float(outcomes[0])
         if yes_price >= 0.99 or yes_price <= 0.01:
+            return False
+        volume = float(market.get("volumeNum", 0) or 0)
+        if volume < 100:
             return False
         return True
     except:
@@ -175,8 +182,14 @@ def is_market_active(market):
 def score_opportunity(market):
     try:
         question = market.get("question", "").lower()
-        tokens = market.get("tokens", [])
-        yes_price = float(tokens[0].get("price", 0.5))
+        outcomes = market.get("outcomePrices", "[]")
+        if isinstance(outcomes, str):
+            import json as j
+            outcomes = j.loads(outcomes)
+        yes_price = float(outcomes[0])
+        volume = float(market.get("volumeNum", 0) or 0)
+        volume_24h = float(market.get("volume24hr", 0) or 0)
+        end_date = market.get("endDateIso", "")
     except:
         return 0, "Could not parse"
 
@@ -205,7 +218,16 @@ def score_opportunity(market):
         score += 15
         reasons.append("Politics market")
 
-    end_date = market.get("end_date_iso", "")
+    if volume_24h > 50000:
+        score += 25
+        reasons.append("Very high 24h volume $" + str(round(volume_24h)))
+    elif volume_24h > 10000:
+        score += 15
+        reasons.append("High 24h volume $" + str(round(volume_24h)))
+    elif volume_24h > 1000:
+        score += 5
+        reasons.append("Medium 24h volume $" + str(round(volume_24h)))
+
     if end_date:
         try:
             end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
@@ -222,15 +244,17 @@ def score_opportunity(market):
     return score, " | ".join(reasons) if reasons else "General market"
 
 async def scan_markets():
-    log.info("Polymarket Bot v6 Starting...")
+    log.info("Polymarket Bot v7 Starting...")
+    log.info("Using Gamma API - correct endpoint!")
     log.info("=" * 50)
 
     await send_telegram(
-        "<b>Polymarket Bot v6 Started!</b>\n\n"
-        "Fixed filtering using active/closed fields\n"
-        "Added time-sensitive scoring\n"
-        "Database tracking ON\n"
-        "Daily summaries at 9am EST"
+        "<b>Polymarket Bot v7 Started!</b>\n\n"
+        "Now using correct Gamma API\n"
+        "Real volume data available\n"
+        "Proper active/closed filtering\n"
+        "Daily summaries at 9am EST\n\n"
+        "This should work properly now!"
     )
 
     db = load_database()
@@ -258,21 +282,25 @@ async def scan_markets():
                 score, reason = score_opportunity(market)
                 if score >= 40:
                     question = market.get("question", "Unknown")
-                    tokens = market.get("tokens", [])
-                    yes_price = float(tokens[0].get("price", 0)) if tokens else 0
-                    market_id = market.get("condition_id", question[:50])
+                    outcomes = market.get("outcomePrices", "[0.5]")
+                    if isinstance(outcomes, str):
+                        import json as j
+                        outcomes = j.loads(outcomes)
+                    yes_price = float(outcomes[0]) if outcomes else 0.5
+                    market_id = market.get("id", question[:50])
+                    volume = float(market.get("volumeNum", 0) or 0)
 
                     opportunities.append({
-                        "id": market_id,
+                        "id": str(market_id),
                         "question": question,
                         "score": score,
                         "reason": reason,
                         "yes_price": yes_price,
-                        "volume": 0
+                        "volume": volume
                     })
 
-                    if market_id in alerted_markets:
-                        update_price_history(db, market_id, yes_price)
+                    if str(market_id) in alerted_markets:
+                        update_price_history(db, str(market_id), yes_price)
 
             opportunities.sort(key=lambda x: x["score"], reverse=True)
 
@@ -286,7 +314,8 @@ async def scan_markets():
                             "<b>Market:</b> " + opp["question"][:100] + "\n"
                             "<b>YES Price:</b> " + str(round(opp["yes_price"] * 100)) + "%\n"
                             "<b>Score:</b> " + str(opp["score"]) + "/100\n"
-                            "<b>Why:</b> " + opp["reason"] + "\n\n"
+                            "<b>Why:</b> " + opp["reason"] + "\n"
+                            "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n\n"
                             "Research before trading!"
                         )
                         await send_telegram(msg)
