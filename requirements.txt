@@ -1,4 +1,4 @@
 aiohttp
-asyncio
+asyncpg
 requests
 python-dotenv
