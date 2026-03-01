@@ -9,7 +9,7 @@ CONFIG = {
     "check_interval_seconds": 30,
     "min_score_for_alert": 70,
     "markets_per_page": 100,
-    "max_pages": 20,
+    "max_pages": 50,
     "summary_hour_utc": 13,
 }
 
