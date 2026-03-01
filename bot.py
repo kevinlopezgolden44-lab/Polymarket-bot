@@ -1,4 +1,4 @@
-import asyncio
+Fimport asyncio
 import aiohttp
 import logging
 import os
@@ -70,7 +70,8 @@ async def log_alert(conn, opportunity):
         opportunity["score"],
         opportunity["reason"],
         opportunity["volume"],
-        datetime.now(timezone.utc)
+        datetime.utcnow()
+
     )
     count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     log.info("Alert logged to database (total: %d)", count)
@@ -79,7 +80,7 @@ async def update_price_history(conn, market_id, yes_price):
     await conn.execute("""
         INSERT INTO price_history (market_id, yes_price, recorded_at)
         VALUES ($1, $2, $3)
-    """, market_id, yes_price, datetime.now(timezone.utc))
+    """, market_id, yes_price, datetime.utcnow()
 
 async def get_daily_stats(conn):
     rows = await conn.fetch("""
@@ -383,4 +384,5 @@ async def scan_markets():
         await asyncio.sleep(CONFIG["check_interval_seconds"])
 
 if __name__ == "__main__":
+
     asyncio.run(scan_markets())
