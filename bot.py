@@ -187,7 +187,6 @@ async def fetch_all_markets():
 # ============================================================
 # MARKET FILTERING - SIMPLIFIED
 # ===========================================================
-=
 def is_market_active(market):
     tokens = market.get("tokens", [])
     if not tokens:
