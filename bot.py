@@ -1,4 +1,3 @@
-Fimport asyncio
 import aiohttp
 import logging
 import os
@@ -386,3 +385,4 @@ async def scan_markets():
 if __name__ == "__main__":
 
     asyncio.run(scan_markets())
+
