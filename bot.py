@@ -1,8 +1,9 @@
+import asyncio
 import aiohttp
 import logging
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 import asyncpg
 
 CONFIG = {
@@ -24,6 +25,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger(__name__)
+
+def now():
+    return datetime.utcnow()
 
 async def init_db(conn):
     await conn.execute("""
@@ -69,8 +73,7 @@ async def log_alert(conn, opportunity):
         opportunity["score"],
         opportunity["reason"],
         opportunity["volume"],
-        datetime.utcnow()
-
+        now()
     )
     count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     log.info("Alert logged to database (total: %d)", count)
@@ -79,7 +82,7 @@ async def update_price_history(conn, market_id, yes_price):
     await conn.execute("""
         INSERT INTO price_history (market_id, yes_price, recorded_at)
         VALUES ($1, $2, $3)
-    """, market_id, yes_price, datetime.utcnow()
+    """, market_id, yes_price, now())
 
 async def get_daily_stats(conn):
     rows = await conn.fetch("""
@@ -121,7 +124,7 @@ async def send_daily_summary(conn):
     avg_score = sum(a["score"] for a in alerts_today) / len(alerts_today) if alerts_today else 0
     msg = (
         "<b>Daily Summary Report</b>\n"
-        + datetime.now(timezone.utc).strftime("%B %d, %Y") + "\n\n"
+        + now().strftime("%B %d, %Y") + "\n\n"
         + "Alerts today: " + str(len(alerts_today)) + "\n"
         + "Avg score: " + str(round(avg_score)) + "/100\n\n"
         + "Crypto: " + str(crypto_count) + "\n"
@@ -138,7 +141,7 @@ async def send_heartbeat(conn):
     alerts_today = await get_daily_stats(conn)
     msg = (
         "<b>Bot Heartbeat</b>\n"
-        + datetime.now(timezone.utc).strftime("%B %d, %Y %H:%M UTC") + "\n\n"
+        + now().strftime("%B %d, %Y %H:%M UTC") + "\n\n"
         + "Status: Running normally\n"
         + "Alerts today: " + str(len(alerts_today)) + "\n"
         + "Total alerts in database: " + str(total_count) + "\n\n"
@@ -154,7 +157,6 @@ async def fetch_all_markets():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
     }
-    last_error_time = None
     async with aiohttp.ClientSession() as session:
         while offset < CONFIG["max_pages"] * CONFIG["markets_per_page"]:
             url = (
@@ -256,8 +258,8 @@ def score_opportunity(market):
 
     if end_date:
         try:
-            end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-            hours_left = (end - datetime.now(timezone.utc)).total_seconds() / 3600
+            end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            hours_left = (end - now()).total_seconds() / 3600
             if 0 < hours_left < 24:
                 score += 20
                 reasons.append("Closing in " + str(round(hours_left)) + "h")
@@ -270,7 +272,7 @@ def score_opportunity(market):
     return score, " | ".join(reasons) if reasons else "General market"
 
 async def scan_markets():
-    log.info("Polymarket Bot v8 Starting...")
+    log.info("Polymarket Bot v9 Starting...")
     log.info("PostgreSQL persistent database ON")
     log.info("Error alerting ON")
     log.info("Daily heartbeat ON")
@@ -280,12 +282,12 @@ async def scan_markets():
     await init_db(conn)
 
     await send_telegram(
-        "<b>Polymarket Bot v8 Started!</b>\n\n"
+        "<b>Polymarket Bot v9 Started!</b>\n\n"
         "Persistent PostgreSQL database\n"
         "Error alerting enabled\n"
         "Daily heartbeat at 8am EST\n"
         "Daily summary at 9am EST\n\n"
-        "Your data is now safe from resets!"
+        "Timezone bug fixed!"
     )
 
     alerted_markets = await get_alerted_markets(conn)
@@ -295,15 +297,15 @@ async def scan_markets():
 
     while True:
         try:
-            now = datetime.now(timezone.utc)
+            current_time = now()
 
-            if now.hour == CONFIG["heartbeat_hour_utc"] and now.date() != last_heartbeat_date:
+            if current_time.hour == CONFIG["heartbeat_hour_utc"] and current_time.date() != last_heartbeat_date:
                 await send_heartbeat(conn)
-                last_heartbeat_date = now.date()
+                last_heartbeat_date = current_time.date()
 
-            if now.hour == CONFIG["summary_hour_utc"] and now.date() != last_summary_date:
+            if current_time.hour == CONFIG["summary_hour_utc"] and current_time.date() != last_summary_date:
                 await send_daily_summary(conn)
-                last_summary_date = now.date()
+                last_summary_date = current_time.date()
 
             log.info("Scanning Polymarket markets...")
             markets = await fetch_all_markets()
@@ -383,6 +385,4 @@ async def scan_markets():
         await asyncio.sleep(CONFIG["check_interval_seconds"])
 
 if __name__ == "__main__":
-
     asyncio.run(scan_markets())
-
