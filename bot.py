@@ -27,6 +27,7 @@ CONFIG = {
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,7 +105,6 @@ async def update_risk_state(conn, profitable):
         SET win_streak = $1, loss_streak = $2, trade_size_multiplier = $3
         WHERE date = $4
     """, new_win, new_loss, multiplier, today)
-    log.info("Risk state updated: win_streak=%d loss_streak=%d multiplier=%.2f", new_win, new_loss, multiplier)
 
 def get_dynamic_limits(state):
     cfg = CONFIG["dynamic_risk"]
@@ -224,6 +224,190 @@ async def process_feedback(conn, updates, last_update_id):
                 )
     return new_last_id
 
+async def get_crypto_research(question):
+    try:
+        question_lower = question.lower()
+        if "ethereum" in question_lower or "eth" in question_lower:
+            coin_id = "ethereum"
+            coin_symbol = "ETH"
+        elif "solana" in question_lower or "sol" in question_lower:
+            coin_id = "solana"
+            coin_symbol = "SOL"
+        else:
+            coin_id = "bitcoin"
+            coin_symbol = "BTC"
+
+        url = "https://api.coincap.io/v2/assets/" + coin_id
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    asset = data.get("data", {})
+                    price = float(asset.get("priceUsd", 0))
+                    change_24h = float(asset.get("changePercent24Hr", 0))
+                    direction = "UP" if change_24h > 0 else "DOWN"
+                    return {
+                        "coin": coin_symbol,
+                        "price": price,
+                        "change_24h": round(change_24h, 2),
+                        "direction": direction,
+                        "success": True
+                    }
+    except Exception as e:
+        log.error("CoinCap error: %s", e)
+    return {"success": False}
+
+def analyze_crypto_market(question, yes_price, crypto_data):
+    if not crypto_data.get("success"):
+        return "Could not fetch live price data"
+
+    current_price = crypto_data["price"]
+    coin = crypto_data["coin"]
+    change = crypto_data["change_24h"]
+    direction = crypto_data["direction"]
+
+    import re
+    numbers = re.findall(r"\$[\d,]+", question)
+    target_price = None
+    if numbers:
+        try:
+            target_price = float(numbers[0].replace("$", "").replace(",", ""))
+        except:
+            pass
+
+    lines = []
+    lines.append("Current " + coin + ": $" + str(round(current_price, 2)))
+    lines.append("24h change: " + str(change) + "% " + direction)
+
+    if target_price:
+        diff_pct = round((target_price - current_price) / current_price * 100, 1)
+        if diff_pct > 0:
+            lines.append("Target $" + str(round(target_price)) + " needs +" + str(diff_pct) + "% move")
+        else:
+            lines.append("Target $" + str(round(target_price)) + " needs " + str(diff_pct) + "% move")
+
+        if yes_price < 0.15:
+            if abs(diff_pct) > 10:
+                lines.append("Assessment: Target far from current price")
+                lines.append("Recommendation: LIKELY DISAGREE")
+            else:
+                lines.append("Assessment: Target reachable but priced very low")
+                lines.append("Recommendation: INVESTIGATE FURTHER")
+        elif yes_price > 0.85:
+            if abs(diff_pct) < 5:
+                lines.append("Assessment: Target close, priced very high")
+                lines.append("Recommendation: LIKELY AGREE")
+            else:
+                lines.append("Assessment: Target far but priced high")
+                lines.append("Recommendation: INVESTIGATE FURTHER")
+
+    return "\n".join(lines)
+
+async def get_sports_research(question):
+    if not ODDS_API_KEY:
+        return {"success": False, "reason": "No Odds API key"}
+
+    sports_map = {
+        "nba": "basketball_nba",
+        "nfl": "americanfootball_nfl",
+        "mlb": "baseball_mlb",
+        "nhl": "icehockey_nhl",
+        "ufc": "mma_mixed_martial_arts",
+        "premier league": "soccer_epl",
+        "champions league": "soccer_uefa_champs_league",
+        "super bowl": "americanfootball_nfl"
+    }
+
+    sport_key = "basketball_nba"
+    question_lower = question.lower()
+    for keyword, key in sports_map.items():
+        if keyword in question_lower:
+            sport_key = key
+            break
+
+    try:
+        url = (
+            "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
+            "?apiKey=" + ODDS_API_KEY
+            + "&regions=us&markets=h2h&oddsFormat=decimal"
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    games = await resp.json()
+                    if games:
+                        words = question_lower.split()
+                        best_match = None
+                        best_score = 0
+                        for game in games:
+                            home = game.get("home_team", "").lower()
+                            away = game.get("away_team", "").lower()
+                            match_score = sum(1 for w in words if w in home or w in away)
+                            if match_score > best_score:
+                                best_score = match_score
+                                best_match = game
+
+                        if best_match and best_score >= 1:
+                            home_team = best_match.get("home_team", "")
+                            away_team = best_match.get("away_team", "")
+                            bookmakers = best_match.get("bookmakers", [])
+                            if bookmakers:
+                                outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
+                                odds_data = {}
+                                for o in outcomes:
+                                    decimal_odds = float(o.get("price", 2.0))
+                                    implied_prob = round(1 / decimal_odds * 100, 1)
+                                    odds_data[o.get("name", "")] = implied_prob
+                                return {
+                                    "success": True,
+                                    "home_team": home_team,
+                                    "away_team": away_team,
+                                    "odds": odds_data
+                                }
+    except Exception as e:
+        log.error("Odds API error: %s", e)
+    return {"success": False, "reason": "No matching game found"}
+
+def analyze_sports_market(question, yes_price, sports_data):
+    if not sports_data.get("success"):
+        return "Could not fetch live odds data"
+
+    home = sports_data["home_team"]
+    away = sports_data["away_team"]
+    odds = sports_data["odds"]
+
+    lines = []
+    lines.append("Matchup: " + away + " vs " + home)
+
+    question_lower = question.lower()
+    matched_team = None
+    matched_prob = None
+    for team, prob in odds.items():
+        if any(word in question_lower for word in team.lower().split()):
+            matched_team = team
+            matched_prob = prob
+            break
+
+    for team, prob in odds.items():
+        lines.append("Vegas odds: " + team + " " + str(prob) + "% implied")
+
+    if matched_team and matched_prob:
+        polymarket_pct = round(yes_price * 100, 1)
+        gap = round(matched_prob - polymarket_pct, 1)
+        lines.append("Polymarket YES: " + str(polymarket_pct) + "%")
+        lines.append("Vegas implied: " + str(matched_prob) + "%")
+        if gap > 10:
+            lines.append("Gap: +" + str(gap) + "% vs Vegas")
+            lines.append("Recommendation: AGREE - underpriced vs Vegas")
+        elif gap < -10:
+            lines.append("Gap: " + str(gap) + "% vs Vegas")
+            lines.append("Recommendation: DISAGREE - overpriced vs Vegas")
+        else:
+            lines.append("Gap: " + str(gap) + "% vs Vegas")
+            lines.append("Recommendation: FAIR PRICE - small gap")
+
+    return "\n".join(lines)
+
 async def check_resolutions(conn):
     unresolved = await conn.fetch("""
         SELECT * FROM alerts
@@ -271,17 +455,16 @@ async def check_resolutions(conn):
                                     """, outcome, profitable, alert["id"])
                                     await update_risk_state(conn, profitable)
                                     resolved_count += 1
-                                    log.info("Resolved alert %d: %s -> outcome=%s profitable=%s",
-                                             alert["id"], alert["question"][:40], outcome, profitable)
+                                    log.info("Resolved alert %d: outcome=%s profitable=%s",
+                                             alert["id"], outcome, profitable)
                 await asyncio.sleep(0.3)
             except Exception as e:
                 log.error("Error checking resolution for alert %d: %s", alert["id"], e)
 
     if resolved_count > 0:
-        log.info("Resolved %d alerts today", resolved_count)
         await send_telegram(
             "<b>Resolution Check Complete</b>\n\n"
-            "Resolved " + str(resolved_count) + " markets today\n"
+            "Resolved " + str(resolved_count) + " markets\n"
             "Check your daily summary for updated win rate!"
         )
 
@@ -470,30 +653,48 @@ def score_opportunity(market):
 
     return score, " | ".join(reasons) if reasons else "General market"
 
+async def build_research_summary(question, yes_price, reason):
+    summary_lines = []
+    is_crypto = "Crypto market" in reason
+    is_sports = "Sports market" in reason
+
+    if is_crypto:
+        crypto_data = await get_crypto_research(question)
+        analysis = analyze_crypto_market(question, yes_price, crypto_data)
+        summary_lines.append("Crypto Research:")
+        summary_lines.append(analysis)
+
+    if is_sports:
+        sports_data = await get_sports_research(question)
+        analysis = analyze_sports_market(question, yes_price, sports_data)
+        summary_lines.append("Sports Research:")
+        summary_lines.append(analysis)
+
+    if not summary_lines:
+        return None
+
+    return "\n".join(summary_lines)
+
 async def scan_markets():
-    log.info("Polymarket Bot v11 Starting...")
-    log.info("PostgreSQL persistent database ON")
-    log.info("Dynamic risk management ON")
-    log.info("Resolution checker ON")
-    log.info("Agree/Disagree feedback ON")
-    log.info("Error alerting ON")
-    log.info("Heartbeat ON")
+    log.info("Polymarket Bot v12 Starting...")
+    log.info("CoinCap crypto research ON")
+    log.info("Sports odds research ON")
+    log.info("All v11 features included")
     log.info("=" * 50)
 
     conn = await asyncpg.connect(DATABASE_URL)
     await init_db(conn)
 
     await send_telegram(
-        "<b>Polymarket Bot v11 Started!</b>\n\n"
-        "Everything included:\n"
+        "<b>Polymarket Bot v12 Started!</b>\n\n"
+        "NEW: Live crypto price research\n"
+        "NEW: Live sports odds research\n"
+        "Research summaries on every alert\n"
         "Persistent PostgreSQL database\n"
         "Dynamic risk management\n"
         "Auto resolution checker\n"
-        "Agree/Disagree feedback buttons\n"
-        "Error alerting\n"
-        "Daily heartbeat at 8am EST\n"
-        "Daily summary at 9am EST\n"
-        "Resolution check at 6am EST\n\n"
+        "Agree/Disagree feedback\n"
+        "Daily heartbeat and summary\n\n"
         "All systems go!"
     )
 
@@ -546,7 +747,6 @@ async def scan_markets():
 
                 state = await get_risk_state(conn)
                 limits = get_dynamic_limits(state)
-                log.info("Current trade size limit: $%.2f", limits["max_trade_size"])
 
                 opportunities = []
                 for market in active_markets:
@@ -581,6 +781,11 @@ async def scan_markets():
                         if opp["score"] >= CONFIG["min_score_for_alert"] and opp["id"] not in alerted_markets:
                             alert_id = await log_alert(conn, opp)
                             alerted_markets.add(opp["id"])
+
+                            research = await build_research_summary(
+                                opp["question"], opp["yes_price"], opp["reason"]
+                            )
+
                             msg = (
                                 "<b>Opportunity Found!</b>\n\n"
                                 "<b>Market:</b> " + opp["question"][:100] + "\n"
@@ -588,9 +793,14 @@ async def scan_markets():
                                 "<b>Score:</b> " + str(opp["score"]) + "/100\n"
                                 "<b>Why:</b> " + opp["reason"] + "\n"
                                 "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n"
-                                "<b>Max Trade Size:</b> $" + str(limits["max_trade_size"]) + "\n\n"
-                                "Do you agree this looks interesting?"
+                                "<b>Max Trade Size:</b> $" + str(limits["max_trade_size"]) + "\n"
                             )
+
+                            if research:
+                                msg += "\n" + research + "\n"
+
+                            msg += "\nDo you agree this looks interesting?"
+
                             reply_markup = {
                                 "inline_keyboard": [[
                                     {"text": "👍 Agree", "callback_data": "agree_" + str(alert_id)},
