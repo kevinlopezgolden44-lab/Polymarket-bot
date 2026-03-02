@@ -9,11 +9,13 @@ import asyncpg
 CONFIG = {
     "check_interval_seconds": 30,
     "min_score_for_alert": 70,
+    "log_opportunity_threshold": 40,
     "markets_per_page": 100,
     "max_pages": 50,
     "summary_hour_utc": 13,
     "heartbeat_hour_utc": 12,
-    "resolution_check_hour_utc": 6,
+    "resolution_check_hours": [6, 8, 10, 12, 14, 16, 18, 20, 22],
+    "weekly_analysis_day": 6,
     "dynamic_risk": {
         "base_daily_loss": 20,
         "base_trade_size": 5,
@@ -52,7 +54,28 @@ async def init_db(conn):
             alerted_at TIMESTAMP NOT NULL,
             outcome TEXT,
             profitable BOOLEAN,
-            user_rating TEXT
+            user_rating TEXT,
+            fear_greed_score INTEGER,
+            fear_greed_regime TEXT,
+            market_age_hours FLOAT,
+            score_components TEXT
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS opportunities_log (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            yes_price FLOAT NOT NULL,
+            score INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            volume FLOAT NOT NULL,
+            logged_at TIMESTAMP NOT NULL,
+            outcome TEXT,
+            profitable BOOLEAN,
+            fear_greed_score INTEGER,
+            fear_greed_regime TEXT,
+            market_age_hours FLOAT
         )
     """)
     await conn.execute("""
@@ -60,6 +83,15 @@ async def init_db(conn):
             id SERIAL PRIMARY KEY,
             market_id TEXT NOT NULL,
             yes_price FLOAT NOT NULL,
+            recorded_at TIMESTAMP NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sentiment_history (
+            id SERIAL PRIMARY KEY,
+            score INTEGER NOT NULL,
+            classification TEXT NOT NULL,
+            regime TEXT NOT NULL,
             recorded_at TIMESTAMP NOT NULL
         )
     """)
@@ -75,6 +107,10 @@ async def init_db(conn):
         )
     """)
     await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_rating TEXT""")
+    await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fear_greed_score INTEGER""")
+    await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fear_greed_regime TEXT""")
+    await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS market_age_hours FLOAT""")
+    await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS score_components TEXT""")
     log.info("Database tables ready")
 
 async def get_risk_state(conn):
@@ -115,10 +151,13 @@ def get_dynamic_limits(state):
         "max_open_positions": cfg["max_open_positions"]
     }
 
-async def log_alert(conn, opportunity):
+async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
+    fg_score = fear_greed.get("score") if fear_greed else None
+    fg_regime = fear_greed.get("regime") if fear_greed else None
     alert_id = await conn.fetchval("""
-        INSERT INTO alerts (market_id, question, yes_price, score, reason, volume, alerted_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO alerts (market_id, question, yes_price, score, reason, volume, alerted_at,
+                           fear_greed_score, fear_greed_regime, market_age_hours, score_components)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id
     """,
         opportunity["id"],
@@ -127,17 +166,61 @@ async def log_alert(conn, opportunity):
         opportunity["score"],
         opportunity["reason"],
         opportunity["volume"],
-        now()
+        now(),
+        fg_score,
+        fg_regime,
+        market_age,
+        opportunity["reason"]
     )
     count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     log.info("Alert logged to database (total: %d)", count)
     return alert_id
 
+async def log_opportunity(conn, opportunity, fear_greed=None, market_age=None):
+    existing = await conn.fetchrow(
+        "SELECT id FROM opportunities_log WHERE market_id = $1", opportunity["id"]
+    )
+    if existing:
+        return
+    fg_score = fear_greed.get("score") if fear_greed else None
+    fg_regime = fear_greed.get("regime") if fear_greed else None
+    await conn.execute("""
+        INSERT INTO opportunities_log (market_id, question, yes_price, score, reason, volume,
+                                      logged_at, fear_greed_score, fear_greed_regime, market_age_hours)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    """,
+        opportunity["id"],
+        opportunity["question"],
+        opportunity["yes_price"],
+        opportunity["score"],
+        opportunity["reason"],
+        opportunity["volume"],
+        now(),
+        fg_score,
+        fg_regime,
+        market_age
+    )
+
 async def update_price_history(conn, market_id, yes_price):
+    last = await conn.fetchrow("""
+        SELECT recorded_at FROM price_history
+        WHERE market_id = $1
+        ORDER BY recorded_at DESC LIMIT 1
+    """, market_id)
+    if last:
+        hours_since = (now() - last["recorded_at"]).total_seconds() / 3600
+        if hours_since < 2:
+            return
     await conn.execute("""
         INSERT INTO price_history (market_id, yes_price, recorded_at)
         VALUES ($1, $2, $3)
     """, market_id, yes_price, now())
+
+async def log_sentiment(conn, fear_greed):
+    await conn.execute("""
+        INSERT INTO sentiment_history (score, classification, regime, recorded_at)
+        VALUES ($1, $2, $3, $4)
+    """, fear_greed["score"], fear_greed["classification"], fear_greed["regime"], now())
 
 async def get_daily_stats(conn):
     rows = await conn.fetch("""
@@ -148,6 +231,10 @@ async def get_daily_stats(conn):
 
 async def get_alerted_markets(conn):
     rows = await conn.fetch("SELECT DISTINCT market_id FROM alerts")
+    return set(row["market_id"] for row in rows)
+
+async def get_logged_opportunities(conn):
+    rows = await conn.fetch("SELECT DISTINCT market_id FROM opportunities_log")
     return set(row["market_id"] for row in rows)
 
 async def send_telegram(message, reply_markup=None):
@@ -220,23 +307,62 @@ async def process_feedback(conn, updates, last_update_id):
                 await send_telegram(
                     emoji + " Feedback recorded for alert #" + alert_id + "\n"
                     "Rating: " + rating.capitalize() + "\n"
-                    "This helps improve the bot scoring over time!"
+                    "This helps improve scoring over time!"
                 )
     return new_last_id
+
+async def get_fear_greed():
+    try:
+        url = "https://api.alternative.me/fng/?limit=7"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    entries = data.get("data", [])
+                    if entries:
+                        current = entries[0]
+                        score = int(current.get("value", 50))
+                        classification = current.get("value_classification", "Neutral")
+                        scores_7d = [int(e.get("value", 50)) for e in entries]
+                        avg_7d = round(sum(scores_7d) / len(scores_7d))
+                        trend = "IMPROVING" if scores_7d[0] > scores_7d[-1] else "DECLINING"
+                        if score <= 25:
+                            regime = "Extreme Fear"
+                            sentiment_bonus = 15 if trend == "IMPROVING" else 5
+                        elif score <= 49:
+                            regime = "Fear"
+                            sentiment_bonus = 5
+                        elif score <= 74:
+                            regime = "Greed"
+                            sentiment_bonus = -5
+                        else:
+                            regime = "Extreme Greed"
+                            sentiment_bonus = -15
+                        return {
+                            "score": score,
+                            "classification": classification,
+                            "regime": regime,
+                            "trend": trend,
+                            "avg_7d": avg_7d,
+                            "sentiment_bonus": sentiment_bonus,
+                            "success": True
+                        }
+    except Exception as e:
+        log.error("Fear and Greed error: %s", e)
+    return {"success": False, "score": 50, "regime": "Unknown", "sentiment_bonus": 0}
 
 async def get_crypto_research(question):
     try:
         question_lower = question.lower()
-        if "ethereum" in question_lower or "eth" in question_lower:
+        if "ethereum" in question_lower or " eth" in question_lower:
             coin_id = "ethereum"
             coin_symbol = "ETH"
-        elif "solana" in question_lower or "sol" in question_lower:
+        elif "solana" in question_lower or " sol" in question_lower:
             coin_id = "solana"
             coin_symbol = "SOL"
         else:
             coin_id = "bitcoin"
             coin_symbol = "BTC"
-
         url = "https://api.coincap.io/v2/assets/" + coin_id
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -257,56 +383,50 @@ async def get_crypto_research(question):
         log.error("CoinCap error: %s", e)
     return {"success": False}
 
-def analyze_crypto_market(question, yes_price, crypto_data):
-    if not crypto_data.get("success"):
-        return "Could not fetch live price data"
-
-    current_price = crypto_data["price"]
-    coin = crypto_data["coin"]
-    change = crypto_data["change_24h"]
-    direction = crypto_data["direction"]
-
-    import re
-    numbers = re.findall(r"\$[\d,]+", question)
-    target_price = None
-    if numbers:
-        try:
-            target_price = float(numbers[0].replace("$", "").replace(",", ""))
-        except:
-            pass
-
+def analyze_crypto_market(question, yes_price, crypto_data, fear_greed):
     lines = []
-    lines.append("Current " + coin + ": $" + str(round(current_price, 2)))
-    lines.append("24h change: " + str(change) + "% " + direction)
-
-    if target_price:
-        diff_pct = round((target_price - current_price) / current_price * 100, 1)
-        if diff_pct > 0:
-            lines.append("Target $" + str(round(target_price)) + " needs +" + str(diff_pct) + "% move")
-        else:
-            lines.append("Target $" + str(round(target_price)) + " needs " + str(diff_pct) + "% move")
-
-        if yes_price < 0.15:
-            if abs(diff_pct) > 10:
-                lines.append("Assessment: Target far from current price")
-                lines.append("Recommendation: LIKELY DISAGREE")
-            else:
-                lines.append("Assessment: Target reachable but priced very low")
-                lines.append("Recommendation: INVESTIGATE FURTHER")
-        elif yes_price > 0.85:
-            if abs(diff_pct) < 5:
-                lines.append("Assessment: Target close, priced very high")
-                lines.append("Recommendation: LIKELY AGREE")
-            else:
-                lines.append("Assessment: Target far but priced high")
-                lines.append("Recommendation: INVESTIGATE FURTHER")
-
+    if crypto_data.get("success"):
+        current_price = crypto_data["price"]
+        coin = crypto_data["coin"]
+        change = crypto_data["change_24h"]
+        direction = crypto_data["direction"]
+        lines.append("Current " + coin + ": $" + str(round(current_price, 2)))
+        lines.append("24h change: " + str(change) + "% " + direction)
+        import re
+        numbers = re.findall(r"\$[\d,]+", question)
+        if numbers:
+            try:
+                target = float(numbers[0].replace("$", "").replace(",", ""))
+                diff_pct = round((target - current_price) / current_price * 100, 1)
+                if diff_pct > 0:
+                    lines.append("Target needs +" + str(diff_pct) + "% move")
+                else:
+                    lines.append("Target needs " + str(diff_pct) + "% move")
+                if yes_price < 0.15 and abs(diff_pct) > 10:
+                    lines.append("Assessment: Target far from current price")
+                    lines.append("Recommendation: LIKELY DISAGREE")
+                elif yes_price < 0.15 and abs(diff_pct) <= 10:
+                    lines.append("Assessment: Target reachable but priced low")
+                    lines.append("Recommendation: INVESTIGATE")
+                elif yes_price > 0.85 and abs(diff_pct) < 5:
+                    lines.append("Assessment: Target close, priced high")
+                    lines.append("Recommendation: LIKELY AGREE")
+                else:
+                    lines.append("Recommendation: INVESTIGATE FURTHER")
+            except:
+                pass
+    if fear_greed.get("success"):
+        lines.append("Fear and Greed: " + str(fear_greed["score"]) + " (" + fear_greed["regime"] + ")")
+        lines.append("7d trend: " + fear_greed["trend"] + " (avg " + str(fear_greed["avg_7d"]) + ")")
+        if fear_greed["regime"] == "Extreme Fear":
+            lines.append("Sentiment: Historically good contrarian conditions")
+        elif fear_greed["regime"] == "Extreme Greed":
+            lines.append("Sentiment: Market euphoric - exercise caution")
     return "\n".join(lines)
 
 async def get_sports_research(question):
     if not ODDS_API_KEY:
-        return {"success": False, "reason": "No Odds API key"}
-
+        return {"success": False}
     sports_map = {
         "nba": "basketball_nba",
         "nfl": "americanfootball_nfl",
@@ -317,14 +437,12 @@ async def get_sports_research(question):
         "champions league": "soccer_uefa_champs_league",
         "super bowl": "americanfootball_nfl"
     }
-
     sport_key = "basketball_nba"
     question_lower = question.lower()
     for keyword, key in sports_map.items():
         if keyword in question_lower:
             sport_key = key
             break
-
     try:
         url = (
             "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
@@ -346,7 +464,6 @@ async def get_sports_research(question):
                             if match_score > best_score:
                                 best_score = match_score
                                 best_match = game
-
                         if best_match and best_score >= 1:
                             home_team = best_match.get("home_team", "")
                             away_team = best_match.get("away_team", "")
@@ -355,8 +472,7 @@ async def get_sports_research(question):
                                 outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
                                 odds_data = {}
                                 for o in outcomes:
-                                    decimal_odds = float(o.get("price", 2.0))
-                                    implied_prob = round(1 / decimal_odds * 100, 1)
+                                    implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
                                     odds_data[o.get("name", "")] = implied_prob
                                 return {
                                     "success": True,
@@ -366,19 +482,16 @@ async def get_sports_research(question):
                                 }
     except Exception as e:
         log.error("Odds API error: %s", e)
-    return {"success": False, "reason": "No matching game found"}
+    return {"success": False}
 
 def analyze_sports_market(question, yes_price, sports_data):
     if not sports_data.get("success"):
-        return "Could not fetch live odds data"
-
+        return "Could not fetch live odds"
     home = sports_data["home_team"]
     away = sports_data["away_team"]
     odds = sports_data["odds"]
-
     lines = []
     lines.append("Matchup: " + away + " vs " + home)
-
     question_lower = question.lower()
     matched_team = None
     matched_prob = None
@@ -387,10 +500,8 @@ def analyze_sports_market(question, yes_price, sports_data):
             matched_team = team
             matched_prob = prob
             break
-
     for team, prob in odds.items():
-        lines.append("Vegas odds: " + team + " " + str(prob) + "% implied")
-
+        lines.append("Vegas: " + team + " " + str(prob) + "%")
     if matched_team and matched_prob:
         polymarket_pct = round(yes_price * 100, 1)
         gap = round(matched_prob - polymarket_pct, 1)
@@ -403,10 +514,27 @@ def analyze_sports_market(question, yes_price, sports_data):
             lines.append("Gap: " + str(gap) + "% vs Vegas")
             lines.append("Recommendation: DISAGREE - overpriced vs Vegas")
         else:
-            lines.append("Gap: " + str(gap) + "% vs Vegas")
-            lines.append("Recommendation: FAIR PRICE - small gap")
-
+            lines.append("Gap: " + str(gap) + "% - fair price")
+            lines.append("Recommendation: INVESTIGATE")
     return "\n".join(lines)
+
+async def build_research_summary(question, yes_price, reason, fear_greed):
+    summary_lines = []
+    is_crypto = "Crypto market" in reason
+    is_sports = "Sports market" in reason
+    if is_crypto:
+        crypto_data = await get_crypto_research(question)
+        analysis = analyze_crypto_market(question, yes_price, crypto_data, fear_greed)
+        summary_lines.append("Crypto Research:")
+        summary_lines.append(analysis)
+    if is_sports:
+        sports_data = await get_sports_research(question)
+        analysis = analyze_sports_market(question, yes_price, sports_data)
+        summary_lines.append("Sports Research:")
+        summary_lines.append(analysis)
+    if not summary_lines:
+        return None
+    return "\n".join(summary_lines)
 
 async def check_resolutions(conn):
     unresolved = await conn.fetch("""
@@ -414,19 +542,23 @@ async def check_resolutions(conn):
         WHERE outcome IS NULL
         AND alerted_at < NOW() - INTERVAL '1 hour'
     """)
-    if not unresolved:
-        log.info("No unresolved alerts to check")
+    unresolved_opps = await conn.fetch("""
+        SELECT * FROM opportunities_log
+        WHERE outcome IS NULL
+        AND logged_at < NOW() - INTERVAL '1 hour'
+    """)
+    all_unresolved = list(unresolved) + list(unresolved_opps)
+    if not all_unresolved:
+        log.info("No unresolved items to check")
         return
-
-    log.info("Checking resolution for %d alerts", len(unresolved))
+    log.info("Checking resolution for %d items", len(all_unresolved))
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
     }
-
     resolved_count = 0
     async with aiohttp.ClientSession() as session:
-        for alert in unresolved:
+        for alert in all_unresolved:
             try:
                 url = "https://gamma-api.polymarket.com/markets?id=" + str(alert["market_id"])
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -448,29 +580,80 @@ async def check_resolutions(conn):
                                         profitable = alert["yes_price"] > 0.5
                                     else:
                                         continue
-                                    await conn.execute("""
-                                        UPDATE alerts
-                                        SET outcome = $1, profitable = $2
-                                        WHERE id = $3
-                                    """, outcome, profitable, alert["id"])
-                                    await update_risk_state(conn, profitable)
+                                    if "alerted_at" in alert.keys():
+                                        await conn.execute("""
+                                            UPDATE alerts
+                                            SET outcome = $1, profitable = $2
+                                            WHERE id = $3
+                                        """, outcome, profitable, alert["id"])
+                                        await update_risk_state(conn, profitable)
+                                    else:
+                                        await conn.execute("""
+                                            UPDATE opportunities_log
+                                            SET outcome = $1, profitable = $2
+                                            WHERE id = $3
+                                        """, outcome, profitable, alert["id"])
                                     resolved_count += 1
-                                    log.info("Resolved alert %d: outcome=%s profitable=%s",
-                                             alert["id"], outcome, profitable)
+                                    log.info("Resolved: %s -> %s profitable=%s",
+                                             alert["question"][:40], outcome, profitable)
                 await asyncio.sleep(0.3)
             except Exception as e:
-                log.error("Error checking resolution for alert %d: %s", alert["id"], e)
-
+                log.error("Resolution error: %s", e)
     if resolved_count > 0:
         await send_telegram(
             "<b>Resolution Check Complete</b>\n\n"
             "Resolved " + str(resolved_count) + " markets\n"
-            "Check your daily summary for updated win rate!"
+            "Win rate data updated!"
         )
+
+async def send_weekly_analysis(conn):
+    total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+    resolved_alerts = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
+    profitable = sum(1 for a in resolved_alerts if a["profitable"])
+    win_rate = round(profitable / len(resolved_alerts) * 100) if resolved_alerts else 0
+    crypto_resolved = [a for a in resolved_alerts if "Crypto" in a["reason"]]
+    sports_resolved = [a for a in resolved_alerts if "Sports" in a["reason"]]
+    politics_resolved = [a for a in resolved_alerts if "Politics" in a["reason"]]
+    crypto_win = round(sum(1 for a in crypto_resolved if a["profitable"]) / len(crypto_resolved) * 100) if crypto_resolved else 0
+    sports_win = round(sum(1 for a in sports_resolved if a["profitable"]) / len(sports_resolved) * 100) if sports_resolved else 0
+    politics_win = round(sum(1 for a in politics_resolved if a["profitable"]) / len(politics_resolved) * 100) if politics_resolved else 0
+    fear_resolved = [a for a in resolved_alerts if a.get("fear_greed_regime") in ["Extreme Fear", "Fear"]]
+    greed_resolved = [a for a in resolved_alerts if a.get("fear_greed_regime") in ["Greed", "Extreme Greed"]]
+    fear_win = round(sum(1 for a in fear_resolved if a["profitable"]) / len(fear_resolved) * 100) if fear_resolved else 0
+    greed_win = round(sum(1 for a in greed_resolved if a["profitable"]) / len(greed_resolved) * 100) if greed_resolved else 0
+    agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating = 'agree' AND outcome IS NOT NULL")
+    agreed_win = round(sum(1 for a in agreed if a["profitable"]) / len(agreed) * 100) if agreed else 0
+    disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating = 'disagree' AND outcome IS NOT NULL")
+    disagreed_win = round(sum(1 for a in disagreed if a["profitable"]) / len(disagreed) * 100) if disagreed else 0
+    msg = (
+        "<b>Weekly Self-Analysis Report</b>\n"
+        + now().strftime("%B %d, %Y") + "\n\n"
+        + "Overall Performance:\n"
+        + "Total alerts: " + str(total_alerts) + "\n"
+        + "Total opportunities logged: " + str(total_opps) + "\n"
+        + "Resolved alerts: " + str(len(resolved_alerts)) + "\n"
+        + "Overall win rate: " + str(win_rate) + "%\n\n"
+        + "Win Rate by Category:\n"
+        + "Crypto: " + str(crypto_win) + "% (" + str(len(crypto_resolved)) + " resolved)\n"
+        + "Sports: " + str(sports_win) + "% (" + str(len(sports_resolved)) + " resolved)\n"
+        + "Politics: " + str(politics_win) + "% (" + str(len(politics_resolved)) + " resolved)\n\n"
+        + "Win Rate by Sentiment:\n"
+        + "During Fear: " + str(fear_win) + "% (" + str(len(fear_resolved)) + " resolved)\n"
+        + "During Greed: " + str(greed_win) + "% (" + str(len(greed_resolved)) + " resolved)\n\n"
+        + "Your Judgment Accuracy:\n"
+        + "When you agreed: " + str(agreed_win) + "% win rate\n"
+        + "When you disagreed: " + str(disagreed_win) + "% win rate\n\n"
+        + "Insight: Keep observing and rating alerts!\n"
+        + "Data improves every week."
+    )
+    await send_telegram(msg)
+    log.info("Weekly analysis sent")
 
 async def send_daily_summary(conn):
     alerts_today = await get_daily_stats(conn)
     total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
     resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
     profitable_count = sum(1 for a in resolved if a["profitable"])
     crypto_count = sum(1 for a in alerts_today if "Crypto" in a["reason"])
@@ -482,6 +665,17 @@ async def send_daily_summary(conn):
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
     state = await get_risk_state(conn)
     limits = get_dynamic_limits(state)
+    sentiment_today = await conn.fetchrow("""
+        SELECT score, regime, trend FROM sentiment_history
+        ORDER BY recorded_at DESC LIMIT 1
+    """)
+    sentiment_line = ""
+    if sentiment_today:
+        sentiment_line = (
+            "Market Sentiment:\n"
+            + "Fear and Greed: " + str(sentiment_today["score"])
+            + " (" + str(sentiment_today["regime"]) + ")\n\n"
+        )
     msg = (
         "<b>Daily Summary Report</b>\n"
         + now().strftime("%B %d, %Y") + "\n\n"
@@ -491,18 +685,21 @@ async def send_daily_summary(conn):
         + "Crypto: " + str(crypto_count) + "\n"
         + "Sports: " + str(sports_count) + "\n"
         + "Politics: " + str(politics_count) + "\n\n"
+        + sentiment_line
         + "Your Ratings:\n"
         + "Agreed: " + str(agreed) + "\n"
         + "Disagreed: " + str(disagreed) + "\n\n"
         + "Resolved Markets:\n"
         + "Total resolved: " + str(len(resolved)) + "\n"
-        + "Would have been profitable: " + str(profitable_count) + "\n"
+        + "Profitable: " + str(profitable_count) + "\n"
         + "Win rate: " + str(win_rate) + "%\n\n"
-        + "Dynamic Risk Limits:\n"
+        + "Dynamic Risk:\n"
         + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
         + "Win streak: " + str(state["win_streak"]) + "\n"
         + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
-        + "Total all time: " + str(total_count) + "\n\n"
+        + "Database:\n"
+        + "Total alerts: " + str(total_count) + "\n"
+        + "Total opportunities logged: " + str(total_opps) + "\n\n"
         + "Keep observing before trading!"
     )
     await send_telegram(msg)
@@ -522,11 +719,8 @@ async def send_heartbeat(conn):
         + "Status: Running normally\n"
         + "Alerts today: " + str(len(alerts_today)) + "\n"
         + "Total in database: " + str(total_count) + "\n"
-        + "Win rate so far: " + str(win_rate) + "%\n\n"
-        + "Current Risk Limits:\n"
-        + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
-        + "Win streak: " + str(state["win_streak"]) + "\n"
-        + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
+        + "Win rate: " + str(win_rate) + "%\n"
+        + "Max trade size: $" + str(limits["max_trade_size"]) + "\n\n"
         + "All systems operational!"
     )
     await send_telegram(msg)
@@ -590,7 +784,17 @@ def is_market_active(market):
     except:
         return False
 
-def score_opportunity(market):
+def get_market_age_hours(market):
+    try:
+        created = market.get("createdAt", "")
+        if created:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(tzinfo=None)
+            return round((now() - created_dt).total_seconds() / 3600, 1)
+    except:
+        pass
+    return None
+
+def score_opportunity(market, fear_greed=None):
     try:
         question = market.get("question", "").lower()
         outcomes = market.get("outcomePrices", "[]")
@@ -613,18 +817,27 @@ def score_opportunity(market):
         score += 25
         reasons.append("YES expensive at " + str(round(yes_price * 100)) + "%")
 
-    if any(word in question for word in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol"]):
+    is_crypto = any(word in question for word in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol"])
+    is_sports = any(word in question for word in ["nba", "nfl", "mlb", "nhl", "ufc", "premier league",
+                                                   "champions league", "world cup", "super bowl",
+                                                   "playoffs", "championship"])
+    is_politics = any(word in question for word in ["president", "election", "senate", "congress",
+                                                     "governor", "parliament", "vote", "referendum"])
+
+    if is_crypto:
         score += 20
         reasons.append("Crypto market")
+        if fear_greed and fear_greed.get("success"):
+            bonus = fear_greed.get("sentiment_bonus", 0)
+            if bonus != 0:
+                score += bonus
+                reasons.append("Sentiment bonus: " + str(bonus))
 
-    if any(word in question for word in ["nba", "nfl", "mlb", "nhl", "ufc", "premier league",
-                                         "champions league", "world cup", "super bowl",
-                                         "playoffs", "championship"]):
+    if is_sports:
         score += 15
         reasons.append("Sports market")
 
-    if any(word in question for word in ["president", "election", "senate", "congress",
-                                         "governor", "parliament", "vote", "referendum"]):
+    if is_politics:
         score += 15
         reasons.append("Politics market")
 
@@ -637,6 +850,11 @@ def score_opportunity(market):
     elif volume_24h > 1000:
         score += 5
         reasons.append("Medium 24h volume $" + str(round(volume_24h)))
+
+    market_age = get_market_age_hours(market)
+    if market_age and market_age < 24:
+        score += 10
+        reasons.append("New market (" + str(round(market_age)) + "h old)")
 
     if end_date:
         try:
@@ -653,57 +871,40 @@ def score_opportunity(market):
 
     return score, " | ".join(reasons) if reasons else "General market"
 
-async def build_research_summary(question, yes_price, reason):
-    summary_lines = []
-    is_crypto = "Crypto market" in reason
-    is_sports = "Sports market" in reason
-
-    if is_crypto:
-        crypto_data = await get_crypto_research(question)
-        analysis = analyze_crypto_market(question, yes_price, crypto_data)
-        summary_lines.append("Crypto Research:")
-        summary_lines.append(analysis)
-
-    if is_sports:
-        sports_data = await get_sports_research(question)
-        analysis = analyze_sports_market(question, yes_price, sports_data)
-        summary_lines.append("Sports Research:")
-        summary_lines.append(analysis)
-
-    if not summary_lines:
-        return None
-
-    return "\n".join(summary_lines)
-
 async def scan_markets():
-    log.info("Polymarket Bot v12 Starting...")
-    log.info("CoinCap crypto research ON")
-    log.info("Sports odds research ON")
-    log.info("All v11 features included")
+    log.info("Polymarket Bot v13 Starting...")
+    log.info("Fear and Greed Index ON")
+    log.info("Full opportunity logging ON")
+    log.info("Resolution check every 2 hours ON")
+    log.info("Weekly self-analysis ON")
+    log.info("Market age tracking ON")
+    log.info("Sentiment-adjusted scoring ON")
     log.info("=" * 50)
 
     conn = await asyncpg.connect(DATABASE_URL)
     await init_db(conn)
 
     await send_telegram(
-        "<b>Polymarket Bot v12 Started!</b>\n\n"
-        "NEW: Live crypto price research\n"
-        "NEW: Live sports odds research\n"
-        "Research summaries on every alert\n"
-        "Persistent PostgreSQL database\n"
-        "Dynamic risk management\n"
-        "Auto resolution checker\n"
-        "Agree/Disagree feedback\n"
-        "Daily heartbeat and summary\n\n"
-        "All systems go!"
+        "<b>Polymarket Bot v13 Started!</b>\n\n"
+        "NEW: Fear and Greed Index tracking\n"
+        "NEW: Sentiment-adjusted scoring\n"
+        "NEW: All 40+ opportunities logged\n"
+        "NEW: Resolution check every 2 hours\n"
+        "NEW: Weekly self-analysis reports\n"
+        "NEW: Market age tracking\n"
+        "All previous features included\n\n"
+        "Maximum data collection mode activated!"
     )
 
     alerted_markets = await get_alerted_markets(conn)
+    logged_opportunities = await get_logged_opportunities(conn)
     last_summary_date = None
     last_heartbeat_date = None
-    last_resolution_date = None
+    last_weekly_date = None
+    last_resolution_hours = set()
     last_update_id = 0
     consecutive_errors = 0
+    fear_greed_cache = {"data": None, "cached_at": None}
 
     while True:
         try:
@@ -713,6 +914,16 @@ async def scan_markets():
             if updates:
                 last_update_id = await process_feedback(conn, updates, last_update_id)
 
+            if fear_greed_cache["cached_at"] is None or (now() - fear_greed_cache["cached_at"]).total_seconds() > 3600:
+                fear_greed = await get_fear_greed()
+                fear_greed_cache["data"] = fear_greed
+                fear_greed_cache["cached_at"] = now()
+                if fear_greed.get("success"):
+                    await log_sentiment(conn, fear_greed)
+                    log.info("Fear and Greed: %d (%s) %s", fear_greed["score"], fear_greed["regime"], fear_greed["trend"])
+            else:
+                fear_greed = fear_greed_cache["data"]
+
             if current_time.hour == CONFIG["heartbeat_hour_utc"] and current_time.date() != last_heartbeat_date:
                 await send_heartbeat(conn)
                 last_heartbeat_date = current_time.date()
@@ -721,10 +932,17 @@ async def scan_markets():
                 await send_daily_summary(conn)
                 last_summary_date = current_time.date()
 
-            if current_time.hour == CONFIG["resolution_check_hour_utc"] and current_time.date() != last_resolution_date:
-                log.info("Running daily resolution check...")
+            if current_time.weekday() == CONFIG["weekly_analysis_day"] and current_time.date() != last_weekly_date:
+                await send_weekly_analysis(conn)
+                last_weekly_date = current_time.date()
+
+            resolution_key = str(current_time.date()) + "_" + str(current_time.hour)
+            if current_time.hour in CONFIG["resolution_check_hours"] and resolution_key not in last_resolution_hours:
+                log.info("Running resolution check...")
                 await check_resolutions(conn)
-                last_resolution_date = current_time.date()
+                last_resolution_hours.add(resolution_key)
+                if len(last_resolution_hours) > 100:
+                    last_resolution_hours = set(list(last_resolution_hours)[-50:])
 
             log.info("Scanning Polymarket markets...")
             markets = await fetch_all_markets()
@@ -736,8 +954,7 @@ async def scan_markets():
                     await send_telegram(
                         "<b>Bot Error Alert</b>\n\n"
                         "Could not reach Polymarket API for 5+ minutes\n"
-                        "Bot is still running and retrying\n"
-                        "Please check Railway logs if this persists"
+                        "Bot is still running and retrying"
                     )
                     consecutive_errors = 0
             else:
@@ -750,8 +967,9 @@ async def scan_markets():
 
                 opportunities = []
                 for market in active_markets:
-                    score, reason = score_opportunity(market)
-                    if score >= 40:
+                    score, reason = score_opportunity(market, fear_greed)
+                    market_age = get_market_age_hours(market)
+                    if score >= CONFIG["log_opportunity_threshold"]:
                         question = market.get("question", "Unknown")
                         outcomes = market.get("outcomePrices", "[0.5]")
                         if isinstance(outcomes, str):
@@ -760,14 +978,22 @@ async def scan_markets():
                         market_id = str(market.get("id", question[:50]))
                         volume = float(market.get("volumeNum", 0) or 0)
 
-                        opportunities.append({
+                        opp = {
                             "id": market_id,
                             "question": question,
                             "score": score,
                             "reason": reason,
                             "yes_price": yes_price,
-                            "volume": volume
-                        })
+                            "volume": volume,
+                            "age": market_age
+                        }
+
+                        if market_id not in logged_opportunities:
+                            await log_opportunity(conn, opp, fear_greed, market_age)
+                            logged_opportunities.add(market_id)
+
+                        if score >= CONFIG["min_score_for_alert"]:
+                            opportunities.append(opp)
 
                         if market_id in alerted_markets:
                             await update_price_history(conn, market_id, yes_price)
@@ -775,15 +1001,15 @@ async def scan_markets():
                 opportunities.sort(key=lambda x: x["score"], reverse=True)
 
                 if opportunities:
-                    log.info("Found %d opportunities", len(opportunities))
+                    log.info("Found %d alertable opportunities", len(opportunities))
                     for opp in opportunities[:5]:
                         log.info("Score:%d | %s", opp["score"], opp["question"][:60])
-                        if opp["score"] >= CONFIG["min_score_for_alert"] and opp["id"] not in alerted_markets:
-                            alert_id = await log_alert(conn, opp)
+                        if opp["id"] not in alerted_markets:
+                            alert_id = await log_alert(conn, opp, fear_greed, opp.get("age"))
                             alerted_markets.add(opp["id"])
 
                             research = await build_research_summary(
-                                opp["question"], opp["yes_price"], opp["reason"]
+                                opp["question"], opp["yes_price"], opp["reason"], fear_greed
                             )
 
                             msg = (
@@ -795,6 +1021,9 @@ async def scan_markets():
                                 "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n"
                                 "<b>Max Trade Size:</b> $" + str(limits["max_trade_size"]) + "\n"
                             )
+
+                            if opp.get("age") and opp["age"] < 24:
+                                msg += "<b>New Market:</b> Only " + str(round(opp["age"])) + "h old\n"
 
                             if research:
                                 msg += "\n" + research + "\n"
@@ -809,7 +1038,7 @@ async def scan_markets():
                             }
                             await send_telegram(msg, reply_markup=reply_markup)
                 else:
-                    log.info("No strong opportunities this scan")
+                    log.info("No new alertable opportunities this scan")
 
         except Exception as e:
             log.error("Unexpected error in main loop: %s", e)
