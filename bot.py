@@ -14,6 +14,14 @@ CONFIG = {
     "summary_hour_utc": 13,
     "heartbeat_hour_utc": 12,
     "resolution_check_hour_utc": 6,
+    "dynamic_risk": {
+        "base_daily_loss": 20,
+        "base_trade_size": 5,
+        "max_open_positions": 10,
+        "win_streak_bonus": 1.25,
+        "loss_streak_penalty": 0.75,
+        "streak_threshold": 3
+    }
 }
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -55,11 +63,59 @@ async def init_db(conn):
         )
     """)
     await conn.execute("""
-        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_rating TEXT
+        CREATE TABLE IF NOT EXISTS risk_log (
+            id SERIAL PRIMARY KEY,
+            date TEXT NOT NULL,
+            daily_loss FLOAT DEFAULT 0,
+            trades_today INTEGER DEFAULT 0,
+            win_streak INTEGER DEFAULT 0,
+            loss_streak INTEGER DEFAULT 0,
+            trade_size_multiplier FLOAT DEFAULT 1.0
+        )
     """)
+    await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_rating TEXT""")
     log.info("Database tables ready")
 
-async def log_alert(conn, opportunity, message_id=None):
+async def get_risk_state(conn):
+    today = now().strftime("%Y-%m-%d")
+    row = await conn.fetchrow("SELECT * FROM risk_log WHERE date = $1", today)
+    if not row:
+        await conn.execute("""
+            INSERT INTO risk_log (date, daily_loss, trades_today, win_streak, loss_streak, trade_size_multiplier)
+            VALUES ($1, 0, 0, 0, 0, 1.0)
+        """, today)
+        row = await conn.fetchrow("SELECT * FROM risk_log WHERE date = $1", today)
+    return dict(row)
+
+async def update_risk_state(conn, profitable):
+    today = now().strftime("%Y-%m-%d")
+    state = await get_risk_state(conn)
+    cfg = CONFIG["dynamic_risk"]
+    if profitable:
+        new_win = state["win_streak"] + 1
+        new_loss = 0
+        multiplier = cfg["win_streak_bonus"] if new_win >= cfg["streak_threshold"] else 1.0
+    else:
+        new_win = 0
+        new_loss = state["loss_streak"] + 1
+        multiplier = cfg["loss_streak_penalty"] if new_loss >= cfg["streak_threshold"] else 1.0
+    await conn.execute("""
+        UPDATE risk_log
+        SET win_streak = $1, loss_streak = $2, trade_size_multiplier = $3
+        WHERE date = $4
+    """, new_win, new_loss, multiplier, today)
+    log.info("Risk state updated: win_streak=%d loss_streak=%d multiplier=%.2f", new_win, new_loss, multiplier)
+
+def get_dynamic_limits(state):
+    cfg = CONFIG["dynamic_risk"]
+    multiplier = state.get("trade_size_multiplier", 1.0)
+    return {
+        "max_trade_size": round(cfg["base_trade_size"] * multiplier, 2),
+        "max_daily_loss": cfg["base_daily_loss"],
+        "max_open_positions": cfg["max_open_positions"]
+    }
+
+async def log_alert(conn, opportunity):
     alert_id = await conn.fetchval("""
         INSERT INTO alerts (market_id, question, yes_price, score, reason, volume, alerted_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -159,7 +215,13 @@ async def process_feedback(conn, updates, last_update_id):
                 await conn.execute("""
                     UPDATE alerts SET user_rating = $1 WHERE id = $2
                 """, rating, int(alert_id))
+                emoji = "👍" if rating == "agree" else "👎"
                 log.info("User rated alert %s as %s", alert_id, rating)
+                await send_telegram(
+                    emoji + " Feedback recorded for alert #" + alert_id + "\n"
+                    "Rating: " + rating.capitalize() + "\n"
+                    "This helps improve the bot scoring over time!"
+                )
     return new_last_id
 
 async def check_resolutions(conn):
@@ -207,14 +269,21 @@ async def check_resolutions(conn):
                                         SET outcome = $1, profitable = $2
                                         WHERE id = $3
                                     """, outcome, profitable, alert["id"])
+                                    await update_risk_state(conn, profitable)
                                     resolved_count += 1
-                                    log.info("Resolved alert %d: %s -> %s (profitable: %s)",
+                                    log.info("Resolved alert %d: %s -> outcome=%s profitable=%s",
                                              alert["id"], alert["question"][:40], outcome, profitable)
                 await asyncio.sleep(0.3)
             except Exception as e:
                 log.error("Error checking resolution for alert %d: %s", alert["id"], e)
 
-    log.info("Resolved %d alerts", resolved_count)
+    if resolved_count > 0:
+        log.info("Resolved %d alerts today", resolved_count)
+        await send_telegram(
+            "<b>Resolution Check Complete</b>\n\n"
+            "Resolved " + str(resolved_count) + " markets today\n"
+            "Check your daily summary for updated win rate!"
+        )
 
 async def send_daily_summary(conn):
     alerts_today = await get_daily_stats(conn)
@@ -225,9 +294,11 @@ async def send_daily_summary(conn):
     sports_count = sum(1 for a in alerts_today if "Sports" in a["reason"])
     politics_count = sum(1 for a in alerts_today if "Politics" in a["reason"])
     avg_score = sum(a["score"] for a in alerts_today) / len(alerts_today) if alerts_today else 0
-    agreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating = 'agree'")
-    disagreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating = 'disagree'")
+    agreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating = 'agree'") or 0
+    disagreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating = 'disagree'") or 0
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
+    state = await get_risk_state(conn)
+    limits = get_dynamic_limits(state)
     msg = (
         "<b>Daily Summary Report</b>\n"
         + now().strftime("%B %d, %Y") + "\n\n"
@@ -244,6 +315,10 @@ async def send_daily_summary(conn):
         + "Total resolved: " + str(len(resolved)) + "\n"
         + "Would have been profitable: " + str(profitable_count) + "\n"
         + "Win rate: " + str(win_rate) + "%\n\n"
+        + "Dynamic Risk Limits:\n"
+        + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
+        + "Win streak: " + str(state["win_streak"]) + "\n"
+        + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
         + "Total all time: " + str(total_count) + "\n\n"
         + "Keep observing before trading!"
     )
@@ -256,6 +331,8 @@ async def send_heartbeat(conn):
     resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
     profitable_count = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
+    state = await get_risk_state(conn)
+    limits = get_dynamic_limits(state)
     msg = (
         "<b>Bot Heartbeat</b>\n"
         + now().strftime("%B %d, %Y %H:%M UTC") + "\n\n"
@@ -263,6 +340,10 @@ async def send_heartbeat(conn):
         + "Alerts today: " + str(len(alerts_today)) + "\n"
         + "Total in database: " + str(total_count) + "\n"
         + "Win rate so far: " + str(win_rate) + "%\n\n"
+        + "Current Risk Limits:\n"
+        + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
+        + "Win streak: " + str(state["win_streak"]) + "\n"
+        + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
         + "All systems operational!"
     )
     await send_telegram(msg)
@@ -390,22 +471,26 @@ def score_opportunity(market):
     return score, " | ".join(reasons) if reasons else "General market"
 
 async def scan_markets():
-    log.info("Polymarket Bot v10 Starting...")
+    log.info("Polymarket Bot v11 Starting...")
     log.info("PostgreSQL persistent database ON")
-    log.info("Error alerting ON")
-    log.info("Daily heartbeat ON")
+    log.info("Dynamic risk management ON")
     log.info("Resolution checker ON")
     log.info("Agree/Disagree feedback ON")
+    log.info("Error alerting ON")
+    log.info("Heartbeat ON")
     log.info("=" * 50)
 
     conn = await asyncpg.connect(DATABASE_URL)
     await init_db(conn)
 
     await send_telegram(
-        "<b>Polymarket Bot v10 Started!</b>\n\n"
+        "<b>Polymarket Bot v11 Started!</b>\n\n"
+        "Everything included:\n"
         "Persistent PostgreSQL database\n"
+        "Dynamic risk management\n"
         "Auto resolution checker\n"
         "Agree/Disagree feedback buttons\n"
+        "Error alerting\n"
         "Daily heartbeat at 8am EST\n"
         "Daily summary at 9am EST\n"
         "Resolution check at 6am EST\n\n"
@@ -459,6 +544,10 @@ async def scan_markets():
                 active_markets = [m for m in markets if is_market_active(m)]
                 log.info("%d total -> %d active after filtering", len(markets), len(active_markets))
 
+                state = await get_risk_state(conn)
+                limits = get_dynamic_limits(state)
+                log.info("Current trade size limit: $%.2f", limits["max_trade_size"])
+
                 opportunities = []
                 for market in active_markets:
                     score, reason = score_opportunity(market)
@@ -498,7 +587,8 @@ async def scan_markets():
                                 "<b>YES Price:</b> " + str(round(opp["yes_price"] * 100)) + "%\n"
                                 "<b>Score:</b> " + str(opp["score"]) + "/100\n"
                                 "<b>Why:</b> " + opp["reason"] + "\n"
-                                "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n\n"
+                                "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n"
+                                "<b>Max Trade Size:</b> $" + str(limits["max_trade_size"]) + "\n\n"
                                 "Do you agree this looks interesting?"
                             )
                             reply_markup = {
