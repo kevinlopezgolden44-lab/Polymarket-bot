@@ -92,6 +92,7 @@ async def init_db(conn):
             score INTEGER NOT NULL,
             classification TEXT NOT NULL,
             regime TEXT NOT NULL,
+            trend TEXT,
             recorded_at TIMESTAMP NOT NULL
         )
     """)
@@ -111,6 +112,7 @@ async def init_db(conn):
     await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fear_greed_regime TEXT""")
     await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS market_age_hours FLOAT""")
     await conn.execute("""ALTER TABLE alerts ADD COLUMN IF NOT EXISTS score_components TEXT""")
+    await conn.execute("""ALTER TABLE sentiment_history ADD COLUMN IF NOT EXISTS trend TEXT""")
     log.info("Database tables ready")
 
 async def get_risk_state(conn):
@@ -218,9 +220,10 @@ async def update_price_history(conn, market_id, yes_price):
 
 async def log_sentiment(conn, fear_greed):
     await conn.execute("""
-        INSERT INTO sentiment_history (score, classification, regime, recorded_at)
-        VALUES ($1, $2, $3, $4)
-    """, fear_greed["score"], fear_greed["classification"], fear_greed["regime"], now())
+        INSERT INTO sentiment_history (score, classification, regime, trend, recorded_at)
+        VALUES ($1, $2, $3, $4, $5)
+    """, fear_greed["score"], fear_greed["classification"], fear_greed["regime"],
+        fear_greed.get("trend", "UNKNOWN"), now())
 
 async def get_daily_stats(conn):
     rows = await conn.fetch("""
@@ -283,6 +286,79 @@ async def get_updates(offset=None):
         pass
     return []
 
+async def send_status(conn):
+    try:
+        resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
+        total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+        total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+        profitable_count = sum(1 for a in resolved if a["profitable"])
+        win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
+
+        crypto_resolved = [a for a in resolved if "Crypto" in a["reason"]]
+        sports_resolved = [a for a in resolved if "Sports" in a["reason"]]
+        politics_resolved = [a for a in resolved if "Politics" in a["reason"]]
+        crypto_win = round(sum(1 for a in crypto_resolved if a["profitable"]) / len(crypto_resolved) * 100) if crypto_resolved else 0
+        sports_win = round(sum(1 for a in sports_resolved if a["profitable"]) / len(sports_resolved) * 100) if sports_resolved else 0
+        politics_win = round(sum(1 for a in politics_resolved if a["profitable"]) / len(politics_resolved) * 100) if politics_resolved else 0
+
+        fear_resolved = [a for a in resolved if a.get("fear_greed_regime") in ["Extreme Fear", "Fear"]]
+        greed_resolved = [a for a in resolved if a.get("fear_greed_regime") in ["Greed", "Extreme Greed"]]
+        fear_win = round(sum(1 for a in fear_resolved if a["profitable"]) / len(fear_resolved) * 100) if fear_resolved else 0
+        greed_win = round(sum(1 for a in greed_resolved if a["profitable"]) / len(greed_resolved) * 100) if greed_resolved else 0
+
+        agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating = 'agree' AND outcome IS NOT NULL")
+        disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating = 'disagree' AND outcome IS NOT NULL")
+        agreed_win = round(sum(1 for a in agreed if a["profitable"]) / len(agreed) * 100) if agreed else 0
+        disagreed_win = round(sum(1 for a in disagreed if a["profitable"]) / len(disagreed) * 100) if disagreed else 0
+
+        state = await get_risk_state(conn)
+        limits = get_dynamic_limits(state)
+
+        sentiment = await conn.fetchrow("""
+            SELECT score, regime, trend FROM sentiment_history
+            ORDER BY recorded_at DESC LIMIT 1
+        """)
+
+        msg = (
+            "<b>Bot Status Report</b>\n"
+            + now().strftime("%B %d, %Y %H:%M UTC") + "\n\n"
+            + "<b>Win Rates:</b>\n"
+            + "Overall: " + str(win_rate) + "% (" + str(len(resolved)) + " resolved)\n"
+            + "Crypto: " + str(crypto_win) + "% (" + str(len(crypto_resolved)) + " resolved)\n"
+            + "Sports: " + str(sports_win) + "% (" + str(len(sports_resolved)) + " resolved)\n"
+            + "Politics: " + str(politics_win) + "% (" + str(len(politics_resolved)) + " resolved)\n\n"
+            + "<b>Sentiment Win Rates:</b>\n"
+            + "During Fear: " + str(fear_win) + "% (" + str(len(fear_resolved)) + " resolved)\n"
+            + "During Greed: " + str(greed_win) + "% (" + str(len(greed_resolved)) + " resolved)\n\n"
+            + "<b>Your Judgment:</b>\n"
+            + "When you agreed: " + str(agreed_win) + "% win rate (" + str(len(agreed)) + " rated)\n"
+            + "When you disagreed: " + str(disagreed_win) + "% win rate (" + str(len(disagreed)) + " rated)\n\n"
+            + "<b>Risk Limits:</b>\n"
+            + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
+            + "Max daily loss: $" + str(limits["max_daily_loss"]) + "\n"
+            + "Max open positions: " + str(limits["max_open_positions"]) + "\n"
+            + "Win streak: " + str(state["win_streak"]) + "\n"
+            + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
+            + "<b>Database:</b>\n"
+            + "Total alerts: " + str(total_alerts) + "\n"
+            + "Opportunities logged: " + str(total_opps) + "\n"
+            + "Resolved alerts: " + str(len(resolved)) + "\n\n"
+        )
+
+        if sentiment:
+            msg += (
+                "<b>Current Sentiment:</b>\n"
+                + "Fear and Greed: " + str(sentiment["score"])
+                + " (" + str(sentiment["regime"]) + ")\n"
+                + "Trend: " + str(sentiment["trend"]) + "\n"
+            )
+
+        await send_telegram(msg)
+        log.info("Status report sent")
+    except Exception as e:
+        log.error("Status error: %s", e)
+        await send_telegram("Error generating status report: " + str(e)[:200])
+
 async def process_feedback(conn, updates, last_update_id):
     new_last_id = last_update_id
     for update in updates:
@@ -290,6 +366,13 @@ async def process_feedback(conn, updates, last_update_id):
         if update_id <= last_update_id:
             continue
         new_last_id = max(new_last_id, update_id)
+
+        message = update.get("message", {})
+        text = message.get("text", "")
+        if text == "/status":
+            log.info("Status command received")
+            await send_status(conn)
+
         callback = update.get("callback_query")
         if callback:
             data = callback.get("data", "")
@@ -349,7 +432,7 @@ async def get_fear_greed():
                         }
     except Exception as e:
         log.error("Fear and Greed error: %s", e)
-    return {"success": False, "score": 50, "regime": "Unknown", "sentiment_bonus": 0}
+    return {"success": False, "score": 50, "regime": "Unknown", "sentiment_bonus": 0, "trend": "UNKNOWN"}
 
 async def get_crypto_research(question):
     try:
@@ -415,9 +498,9 @@ def analyze_crypto_market(question, yes_price, crypto_data, fear_greed):
                     lines.append("Recommendation: INVESTIGATE FURTHER")
             except:
                 pass
-    if fear_greed.get("success"):
+    if fear_greed and fear_greed.get("success"):
         lines.append("Fear and Greed: " + str(fear_greed["score"]) + " (" + fear_greed["regime"] + ")")
-        lines.append("7d trend: " + fear_greed["trend"] + " (avg " + str(fear_greed["avg_7d"]) + ")")
+        lines.append("7d trend: " + fear_greed.get("trend", "UNKNOWN") + " (avg " + str(fear_greed.get("avg_7d", 0)) + ")")
         if fear_greed["regime"] == "Extreme Fear":
             lines.append("Sentiment: Historically good contrarian conditions")
         elif fear_greed["regime"] == "Extreme Greed":
@@ -580,19 +663,13 @@ async def check_resolutions(conn):
                                         profitable = alert["yes_price"] > 0.5
                                     else:
                                         continue
-                                    if "alerted_at" in alert.keys():
-                                        await conn.execute("""
-                                            UPDATE alerts
-                                            SET outcome = $1, profitable = $2
-                                            WHERE id = $3
-                                        """, outcome, profitable, alert["id"])
+                                    table = "alerts" if "alerted_at" in alert.keys() else "opportunities_log"
+                                    await conn.execute(
+                                        "UPDATE " + table + " SET outcome = $1, profitable = $2 WHERE id = $3",
+                                        outcome, profitable, alert["id"]
+                                    )
+                                    if table == "alerts":
                                         await update_risk_state(conn, profitable)
-                                    else:
-                                        await conn.execute("""
-                                            UPDATE opportunities_log
-                                            SET outcome = $1, profitable = $2
-                                            WHERE id = $3
-                                        """, outcome, profitable, alert["id"])
                                     resolved_count += 1
                                     log.info("Resolved: %s -> %s profitable=%s",
                                              alert["question"][:40], outcome, profitable)
@@ -603,7 +680,7 @@ async def check_resolutions(conn):
         await send_telegram(
             "<b>Resolution Check Complete</b>\n\n"
             "Resolved " + str(resolved_count) + " markets\n"
-            "Win rate data updated!"
+            "Type /status to see updated win rate!"
         )
 
 async def send_weekly_analysis(conn):
@@ -631,21 +708,20 @@ async def send_weekly_analysis(conn):
         + now().strftime("%B %d, %Y") + "\n\n"
         + "Overall Performance:\n"
         + "Total alerts: " + str(total_alerts) + "\n"
-        + "Total opportunities logged: " + str(total_opps) + "\n"
-        + "Resolved alerts: " + str(len(resolved_alerts)) + "\n"
-        + "Overall win rate: " + str(win_rate) + "%\n\n"
-        + "Win Rate by Category:\n"
+        + "Opportunities logged: " + str(total_opps) + "\n"
+        + "Resolved: " + str(len(resolved_alerts)) + "\n"
+        + "Win rate: " + str(win_rate) + "%\n\n"
+        + "By Category:\n"
         + "Crypto: " + str(crypto_win) + "% (" + str(len(crypto_resolved)) + " resolved)\n"
         + "Sports: " + str(sports_win) + "% (" + str(len(sports_resolved)) + " resolved)\n"
         + "Politics: " + str(politics_win) + "% (" + str(len(politics_resolved)) + " resolved)\n\n"
-        + "Win Rate by Sentiment:\n"
+        + "By Sentiment:\n"
         + "During Fear: " + str(fear_win) + "% (" + str(len(fear_resolved)) + " resolved)\n"
         + "During Greed: " + str(greed_win) + "% (" + str(len(greed_resolved)) + " resolved)\n\n"
-        + "Your Judgment Accuracy:\n"
-        + "When you agreed: " + str(agreed_win) + "% win rate\n"
-        + "When you disagreed: " + str(disagreed_win) + "% win rate\n\n"
-        + "Insight: Keep observing and rating alerts!\n"
-        + "Data improves every week."
+        + "Your Judgment:\n"
+        + "When agreed: " + str(agreed_win) + "% win rate\n"
+        + "When disagreed: " + str(disagreed_win) + "% win rate\n\n"
+        + "Type /status anytime for live stats!"
     )
     await send_telegram(msg)
     log.info("Weekly analysis sent")
@@ -699,7 +775,8 @@ async def send_daily_summary(conn):
         + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
         + "Database:\n"
         + "Total alerts: " + str(total_count) + "\n"
-        + "Total opportunities logged: " + str(total_opps) + "\n\n"
+        + "Opportunities logged: " + str(total_opps) + "\n\n"
+        + "Type /status anytime for live stats!\n"
         + "Keep observing before trading!"
     )
     await send_telegram(msg)
@@ -721,6 +798,7 @@ async def send_heartbeat(conn):
         + "Total in database: " + str(total_count) + "\n"
         + "Win rate: " + str(win_rate) + "%\n"
         + "Max trade size: $" + str(limits["max_trade_size"]) + "\n\n"
+        + "Type /status anytime for full stats!\n"
         + "All systems operational!"
     )
     await send_telegram(msg)
@@ -872,28 +950,24 @@ def score_opportunity(market, fear_greed=None):
     return score, " | ".join(reasons) if reasons else "General market"
 
 async def scan_markets():
-    log.info("Polymarket Bot v13 Starting...")
-    log.info("Fear and Greed Index ON")
-    log.info("Full opportunity logging ON")
-    log.info("Resolution check every 2 hours ON")
-    log.info("Weekly self-analysis ON")
-    log.info("Market age tracking ON")
-    log.info("Sentiment-adjusted scoring ON")
+    log.info("Polymarket Bot v14 Starting...")
+    log.info("Status command /status ON")
+    log.info("All v13 features included")
     log.info("=" * 50)
 
     conn = await asyncpg.connect(DATABASE_URL)
     await init_db(conn)
 
     await send_telegram(
-        "<b>Polymarket Bot v13 Started!</b>\n\n"
-        "NEW: Fear and Greed Index tracking\n"
-        "NEW: Sentiment-adjusted scoring\n"
-        "NEW: All 40+ opportunities logged\n"
-        "NEW: Resolution check every 2 hours\n"
-        "NEW: Weekly self-analysis reports\n"
-        "NEW: Market age tracking\n"
-        "All previous features included\n\n"
-        "Maximum data collection mode activated!"
+        "<b>Polymarket Bot v14 Started!</b>\n\n"
+        "NEW: Type /status anytime for live stats\n"
+        "Fear and Greed Index tracking\n"
+        "Sentiment-adjusted scoring\n"
+        "All 40+ opportunities logged\n"
+        "Resolution check every 2 hours\n"
+        "Weekly self-analysis reports\n"
+        "Market age tracking\n\n"
+        "Type /status now to test it!"
     )
 
     alerted_markets = await get_alerted_markets(conn)
@@ -920,7 +994,7 @@ async def scan_markets():
                 fear_greed_cache["cached_at"] = now()
                 if fear_greed.get("success"):
                     await log_sentiment(conn, fear_greed)
-                    log.info("Fear and Greed: %d (%s) %s", fear_greed["score"], fear_greed["regime"], fear_greed["trend"])
+                    log.info("Fear and Greed: %d (%s) %s", fear_greed["score"], fear_greed["regime"], fear_greed.get("trend", ""))
             else:
                 fear_greed = fear_greed_cache["data"]
 
