@@ -367,12 +367,13 @@ async def process_feedback(conn, updates, last_update_id):
             continue
         new_last_id = max(new_last_id, update_id)
 
-        message = update.get("message", {})
-        text = message.get("text", "")
-        if text == "/status":
-            log.info("Status command received")
-            await send_status(conn)
-
+message = update.get("message", {})
+if message:
+    text = message.get("text", "")
+    if text and "/status" in text.lower():
+        log.info("Status command received")
+        await send_status(conn)
+        
         callback = update.get("callback_query")
         if callback:
             data = callback.get("data", "")
