@@ -331,8 +331,8 @@ async def send_status(conn):
             + "During Fear: " + str(fear_win) + "% (" + str(len(fear_resolved)) + " resolved)\n"
             + "During Greed: " + str(greed_win) + "% (" + str(len(greed_resolved)) + " resolved)\n\n"
             + "<b>Your Judgment:</b>\n"
-            + "When you agreed: " + str(agreed_win) + "% win rate (" + str(len(agreed)) + " rated)\n"
-            + "When you disagreed: " + str(disagreed_win) + "% win rate (" + str(len(disagreed)) + " rated)\n\n"
+            + "When you agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
+            + "When you disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
             + "<b>Risk Limits:</b>\n"
             + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
             + "Max daily loss: $" + str(limits["max_daily_loss"]) + "\n"
@@ -342,12 +342,12 @@ async def send_status(conn):
             + "<b>Database:</b>\n"
             + "Total alerts: " + str(total_alerts) + "\n"
             + "Opportunities logged: " + str(total_opps) + "\n"
-            + "Resolved alerts: " + str(len(resolved)) + "\n\n"
+            + "Resolved alerts: " + str(len(resolved)) + "\n"
         )
 
         if sentiment:
             msg += (
-                "<b>Current Sentiment:</b>\n"
+                "\n<b>Current Sentiment:</b>\n"
                 + "Fear and Greed: " + str(sentiment["score"])
                 + " (" + str(sentiment["regime"]) + ")\n"
                 + "Trend: " + str(sentiment["trend"]) + "\n"
@@ -357,7 +357,7 @@ async def send_status(conn):
         log.info("Status report sent")
     except Exception as e:
         log.error("Status error: %s", e)
-        await send_telegram("Error generating status report: " + str(e)[:200])
+        await send_telegram("Error generating status: " + str(e)[:200])
 
 async def process_feedback(conn, updates, last_update_id):
     new_last_id = last_update_id
@@ -367,13 +367,13 @@ async def process_feedback(conn, updates, last_update_id):
             continue
         new_last_id = max(new_last_id, update_id)
 
-message = update.get("message", {})
-if message:
-    text = message.get("text", "")
-    if text and "/status" in text.lower():
-        log.info("Status command received")
-        await send_status(conn)
-        
+        message = update.get("message", {})
+        if message:
+            text = message.get("text", "")
+            if text and "/status" in text.lower():
+                log.info("Status command received")
+                await send_status(conn)
+
         callback = update.get("callback_query")
         if callback:
             data = callback.get("data", "")
@@ -799,7 +799,7 @@ async def send_heartbeat(conn):
         + "Total in database: " + str(total_count) + "\n"
         + "Win rate: " + str(win_rate) + "%\n"
         + "Max trade size: $" + str(limits["max_trade_size"]) + "\n\n"
-        + "Type /status anytime for full stats!\n"
+        + "Type /status for full stats!\n"
         + "All systems operational!"
     )
     await send_telegram(msg)
@@ -952,7 +952,7 @@ def score_opportunity(market, fear_greed=None):
 
 async def scan_markets():
     log.info("Polymarket Bot v14 Starting...")
-    log.info("Status command /status ON")
+    log.info("Status command /status FIXED")
     log.info("All v13 features included")
     log.info("=" * 50)
 
@@ -961,7 +961,7 @@ async def scan_markets():
 
     await send_telegram(
         "<b>Polymarket Bot v14 Started!</b>\n\n"
-        "NEW: Type /status anytime for live stats\n"
+        "Status command fixed\n"
         "Fear and Greed Index tracking\n"
         "Sentiment-adjusted scoring\n"
         "All 40+ opportunities logged\n"
