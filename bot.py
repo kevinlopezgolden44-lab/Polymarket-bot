@@ -300,7 +300,23 @@ async def main():
                 opportunities = []
 
                 for market in active_markets:
-                    score, reason, category = score_opportunity(market, fear_greed)
+                    result = score_opportunity(market)
+                    score = result["score"]
+                    reason = " | ".join(result["flags"]) if result["flags"] else "No specific flags"
+                    # Derive category from question keywords
+                    question_lower = market.get("question", "").lower()
+                    if any(w in question_lower for w in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp"]):
+                        category = "Crypto"
+                    elif any(w in question_lower for w in ["nba", "nfl", "mlb", "nhl", "ufc", "soccer", "world cup", "champions league"]):
+                        category = "Sports"
+                    elif any(w in question_lower for w in ["election", "president", "senate", "congress", "vote", "poll", "party"]):
+                        category = "Politics"
+                    elif any(w in question_lower for w in ["fed", "inflation", "gdp", "cpi", "interest rate", "recession", "jobs", "unemployment"]):
+                        category = "Economics"
+                    elif any(w in question_lower for w in ["fda", "drug", "vaccine", "nasa", "launch", "climate", "ai model"]):
+                        category = "Science"
+                    else:
+                        category = "General"
                     market_age = get_market_age_hours(market)
 
                     if score < CONFIG["log_opportunity_threshold"]:
