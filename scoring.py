@@ -101,9 +101,9 @@ def analyze_liquidity(market):
                 "warning": "High total volume but stale - only $" + str(round(volume_24h)) + " in 24h"
             }
         return {"liquid": True, "warning": None}
-    except:
+    except Exception as e:
+        log.warning("analyze_liquidity error: %s", e)
         return {"liquid": True, "warning": None}
-
 # ── 4. CROSS-MARKET CONSISTENCY ────────────────────────────────────────────────
 def check_cross_market_consistency(market, all_markets):
     """
@@ -136,7 +136,7 @@ def check_cross_market_consistency(market, all_markets):
             return inconsistencies
 
         # Find related markets with similar questions
-        for other in all_markets[:200]:  # Check first 200 for performance
+        for other in all_markets:  # scan all markets passed in
             try:
                 other_q = other.get("question", "").lower()
                 if other_q == question:
@@ -179,10 +179,11 @@ def check_cross_market_consistency(market, all_markets):
                             "Inconsistency: $" + str(round(other_target)) +
                             " dip target priced lower than $" + str(round(this_target)) + " target"
                         )
-            except:
+            except Exception as e:
+                log.warning("cross_market inner loop error: %s", e)
                 continue
-    except:
-        pass
+    except Exception as e:
+        log.warning("check_cross_market_consistency error: %s", e)
 
     return inconsistencies[:2]  # Return max 2 inconsistencies
 
@@ -218,10 +219,8 @@ def detect_polymarket_lag(question, yes_price, crypto_data):
                 "LAG DETECTED: BTC already at $" + str(round(current_price)) +
                 " but market only pricing YES at " + str(round(yes_price * 100)) + "% - possible update delay"
             )
-    except:
-        pass
-
-    return None
+    except Exception as e:
+        log.warning("detect_polymarket_lag error: %s", e)
 
 # ── 6. EVENT TIMING AWARENESS ──────────────────────────────────────────────────
 def analyze_event_timing(market, upcoming_events):
@@ -293,7 +292,30 @@ def calculate_confidence_tier(score, confirming_signals, contradicting_signals):
         return "LOW"
 
 
-# ── 9. MARKET AGE ──────────────────────────────────────────────────────────────
+# ── 9. CATEGORY DETECTION ─────────────────────────────────────────────────────
+def detect_category(question):
+    """
+    Derives a category string from the market question.
+    Returns one of: Crypto, Sports, Politics, Economics, Science, General.
+    """
+    q = question.lower()
+    if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp", "ripple"]):
+        return "Crypto"
+    if any(w in q for w in ["nba", "nfl", "mlb", "nhl", "ufc", "soccer", "world cup", "champions league",
+                             "super bowl", "march madness", "ncaa", "premier league"]):
+        return "Sports"
+    if any(w in q for w in ["election", "president", "senate", "congress", "vote", "poll", "party",
+                             "democrat", "republican", "governor", "primary", "midterm"]):
+        return "Politics"
+    if any(w in q for w in ["fed", "inflation", "gdp", "cpi", "interest rate", "recession",
+                             "jobs", "unemployment", "fomc", "nonfarm", "payroll"]):
+        return "Economics"
+    if any(w in q for w in ["fda", "drug", "vaccine", "nasa", "launch", "climate", "ai model",
+                             "spacex", "cancer", "trial", "approval"]):
+        return "Science"
+    return "General"
+
+# ── 10. MARKET AGE ─────────────────────────────────────────────────────────────
 def get_market_age_hours(market):
     """
     Returns how many hours old a market is based on its creation timestamp.
@@ -344,19 +366,20 @@ def is_market_active(market):
         return True
 
 
-# ── 11. SCORE OPPORTUNITY ──────────────────────────────────────────────────────
+# ── 12. SCORE OPPORTUNITY ─────────────────────────────────────────────────────
 def score_opportunity(market, price_history_rows=None, all_markets=None,
-                      crypto_data=None, upcoming_events=None):
+                      crypto_data=None, upcoming_events=None, fear_greed=None):
     """
-    Master scoring function. Aggregates all signals into a 0-100 score
-    with a confidence tier and list of flags.
+    Master scoring function. Aggregates all signals into a 0-100 score.
 
     Returns a dict:
       {
         "score": int,
-        "confidence": "HIGH" | "MEDIUM" | "LOW",
-        "flags": [...],          # warnings / alerts
-        "signals": {...},        # raw sub-results
+        "reason": str,            # human-readable summary of flags
+        "category": str,          # Crypto / Sports / Politics / Economics / Science / General
+        "confidence": str,        # HIGH / MEDIUM / LOW
+        "flags": [...],           # warnings / alerts
+        "signals": {...},         # raw sub-results
       }
     """
     price_history_rows = price_history_rows or []
@@ -364,10 +387,16 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     upcoming_events = upcoming_events or []
 
     question = market.get("question", "")
+    category = detect_category(question)
     flags = []
     confirming = 0
     contradicting = 0
     score = 50  # baseline
+
+    # ── Fear & Greed sentiment bonus ───────────────────────────────────────────
+    if fear_greed and fear_greed.get("success"):
+        bonus = fear_greed.get("sentiment_bonus", 0)
+        score += bonus
 
     # ── Liquidity ──────────────────────────────────────────────────────────────
     liquidity = analyze_liquidity(market)
@@ -418,7 +447,8 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             import json
             outcomes = json.loads(outcomes)
         yes_price = float(outcomes[0]) if outcomes else 0.5
-    except Exception:
+    except Exception as e:
+        log.warning("score_opportunity: could not parse outcomePrices: %s", e)
         yes_price = 0.5
 
     lag = detect_polymarket_lag(question, yes_price, crypto_data)
@@ -433,7 +463,7 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         score += 5
         confirming += 1
 
-    # ── Market age bonus (fresh markets get slight boost) ──────────────────────
+    # ── Market age bonus ───────────────────────────────────────────────────────
     age_hours = get_market_age_hours(market)
     if age_hours is not None and age_hours < 24:
         score += 5
@@ -443,9 +473,12 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     score = max(0, min(100, score))
 
     confidence = calculate_confidence_tier(score, confirming, contradicting)
+    reason = " | ".join(flags) if flags else "Score: " + str(score)
 
     return {
         "score": score,
+        "reason": reason,
+        "category": category,
         "confidence": confidence,
         "flags": flags,
         "signals": {

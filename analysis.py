@@ -101,7 +101,8 @@ def analyze_liquidity(market):
                 "warning": "High total volume but stale - only $" + str(round(volume_24h)) + " in 24h"
             }
         return {"liquid": True, "warning": None}
-    except:
+    except Exception as e:
+        log.warning("analyze_liquidity error: %s", e)
         return {"liquid": True, "warning": None}
 
 # ── 4. CROSS-MARKET CONSISTENCY ────────────────────────────────────────────────
@@ -136,7 +137,7 @@ def check_cross_market_consistency(market, all_markets):
             return inconsistencies
 
         # Find related markets with similar questions
-        for other in all_markets[:200]:  # Check first 200 for performance
+        for other in all_markets:  # scan all markets passed in
             try:
                 other_q = other.get("question", "").lower()
                 if other_q == question:
@@ -179,10 +180,11 @@ def check_cross_market_consistency(market, all_markets):
                             "Inconsistency: $" + str(round(other_target)) +
                             " dip target priced lower than $" + str(round(this_target)) + " target"
                         )
-            except:
+            except Exception as e:
+                log.warning("cross_market inner loop error: %s", e)
                 continue
-    except:
-        pass
+    except Exception as e:
+        log.warning("check_cross_market_consistency error: %s", e)
 
     return inconsistencies[:2]  # Return max 2 inconsistencies
 
@@ -218,8 +220,8 @@ def detect_polymarket_lag(question, yes_price, crypto_data):
                 "LAG DETECTED: BTC already at $" + str(round(current_price)) +
                 " but market only pricing YES at " + str(round(yes_price * 100)) + "% - possible update delay"
             )
-    except:
-        pass
+    except Exception as e:
+        log.warning("detect_polymarket_lag error: %s", e)
 
     return None
 

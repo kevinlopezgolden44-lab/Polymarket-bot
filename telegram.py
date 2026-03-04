@@ -38,8 +38,8 @@ async def answer_callback(token, callback_query_id):
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(url, json={"callback_query_id": callback_query_id})
-    except:
-        pass
+    except Exception as e:
+        log.warning("answer_callback error: %s", e)
 
 async def get_updates(token, offset=None):
     url = "https://api.telegram.org/bot" + token + "/getUpdates"
@@ -53,8 +53,8 @@ async def get_updates(token, offset=None):
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("result", [])
-    except:
-        pass
+    except Exception as e:
+        log.warning("get_updates error: %s", e)
     return []
 
 async def send_alert(token, chat_id, opp, alert_id, research, limits):

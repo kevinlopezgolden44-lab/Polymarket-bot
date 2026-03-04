@@ -170,8 +170,8 @@ def build_crypto_summary(question, yes_price, crypto_data, fear_greed):
                     lines.append("Recommendation: LIKELY AGREE - target close")
                 else:
                     lines.append("Recommendation: INVESTIGATE FURTHER")
-            except:
-                pass
+            except Exception as e:
+                log.warning("build_crypto_summary target calc error: %s", e)
 
     if fear_greed and fear_greed.get("success"):
         lines.append("Fear and Greed: " + str(fear_greed["score"]) +

@@ -12,7 +12,7 @@ from database import (
     log_sentiment, get_daily_stats, get_alerted_markets,
     get_logged_opportunities, check_resolutions
 )
-from scoring import score_opportunity, is_market_active, get_market_age_hours
+from scoring import score_opportunity, is_market_active, detect_category
 from research import get_fear_greed, build_research_summary, get_crypto_data
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -100,7 +100,8 @@ async def load_upcoming_events(conn):
             ORDER BY event_date ASC
         """)
         return [dict(r) for r in rows]
-    except:
+    except Exception as e:
+        log.warning("load_upcoming_events error: %s", e)
         return []
 
 async def seed_event_calendar(conn):
@@ -300,24 +301,16 @@ async def main():
                 opportunities = []
 
                 for market in active_markets:
-                    result = score_opportunity(market)
+                    result = score_opportunity(
+                        market,
+                        all_markets=active_markets,
+                        upcoming_events=upcoming_events,
+                        fear_greed=fear_greed
+                    )
                     score = result["score"]
-                    reason = " | ".join(result["flags"]) if result["flags"] else "No specific flags"
-                    # Derive category from question keywords
-                    question_lower = market.get("question", "").lower()
-                    if any(w in question_lower for w in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp"]):
-                        category = "Crypto"
-                    elif any(w in question_lower for w in ["nba", "nfl", "mlb", "nhl", "ufc", "soccer", "world cup", "champions league"]):
-                        category = "Sports"
-                    elif any(w in question_lower for w in ["election", "president", "senate", "congress", "vote", "poll", "party"]):
-                        category = "Politics"
-                    elif any(w in question_lower for w in ["fed", "inflation", "gdp", "cpi", "interest rate", "recession", "jobs", "unemployment"]):
-                        category = "Economics"
-                    elif any(w in question_lower for w in ["fda", "drug", "vaccine", "nasa", "launch", "climate", "ai model"]):
-                        category = "Science"
-                    else:
-                        category = "General"
-                    market_age = get_market_age_hours(market)
+                    reason = result["reason"]
+                    category = result["category"]
+                    market_age = result["signals"]["age_hours"]
 
                     if score < CONFIG["log_opportunity_threshold"]:
                         continue
