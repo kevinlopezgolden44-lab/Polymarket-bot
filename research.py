@@ -1,12 +1,18 @@
 import aiohttp
+import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 log = logging.getLogger(__name__)
 
 def now():
     return datetime.utcnow()
+
+# ── MODULE-LEVEL CACHE ─────────────────────────────────────────────────────────
+_crypto_cache: dict = {}          # coingecko_id -> {"data": ..., "fetched_at": datetime}
+_crypto_lock = asyncio.Lock()     # prevents simultaneous duplicate requests
+CRYPTO_CACHE_TTL_SECONDS = 120   # reuse data for 2 minutes before re-fetching
 
 async def get_fear_greed():
     try:
@@ -49,46 +55,81 @@ async def get_fear_greed():
     return {"success": False, "score": 50, "regime": "Unknown",
             "sentiment_bonus": 0, "trend": "UNKNOWN", "classification": "Unknown"}
 
-async def get_crypto_data(question):
-    question_lower = question.lower()
-    if "ethereum" in question_lower or " eth" in question_lower:
-        coingecko_id = "ethereum"
-        coin_symbol = "ETH"
-    elif "solana" in question_lower or " sol" in question_lower:
-        coingecko_id = "solana"
-        coin_symbol = "SOL"
-    elif "xrp" in question_lower or "ripple" in question_lower:
-        coingecko_id = "ripple"
-        coin_symbol = "XRP"
-    else:
-        coingecko_id = "bitcoin"
-        coin_symbol = "BTC"
+def _parse_coin(question: str) -> tuple[str, str]:
+    """Return (coingecko_id, symbol) based on question text."""
+    q = question.lower()
+    if "ethereum" in q or " eth" in q:
+        return "ethereum", "ETH"
+    if "solana" in q or " sol" in q:
+        return "solana", "SOL"
+    if "xrp" in q or "ripple" in q:
+        return "ripple", "XRP"
+    return "bitcoin", "BTC"
 
-    try:
-        url = (
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=" + coingecko_id +
-            "&vs_currencies=usd&include_24hr_change=true"
-        )
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    asset = data.get(coingecko_id, {})
-                    price = float(asset.get("usd", 0))
-                    change_24h = float(asset.get("usd_24h_change", 0))
-                    return {
-                        "coin": coin_symbol,
-                        "price": price,
-                        "change_24h": round(change_24h, 2),
-                        "direction": "UP" if change_24h > 0 else "DOWN",
-                        "success": True
-                    }
-                elif resp.status == 429:
-                    log.warning("CoinGecko rate limit hit - crypto analysis skipped this scan")
-    except Exception as e:
-        log.error("CoinGecko error: %s", e)
+async def _fetch_coingecko(coingecko_id: str, coin_symbol: str) -> dict:
+    """Raw fetch from CoinGecko with retry-after support. Returns success dict or {"success": False}."""
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=" + coingecko_id +
+        "&vs_currencies=usd&include_24hr_change=true"
+    )
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        asset = data.get(coingecko_id, {})
+                        price = float(asset.get("usd", 0))
+                        change_24h = float(asset.get("usd_24h_change", 0))
+                        return {
+                            "coin": coin_symbol,
+                            "price": price,
+                            "change_24h": round(change_24h, 2),
+                            "direction": "UP" if change_24h > 0 else "DOWN",
+                            "success": True,
+                        }
+                    elif resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", 60))
+                        log.warning(
+                            "CoinGecko rate limit hit (attempt %d/3) - waiting %ds",
+                            attempt + 1, retry_after,
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(retry_after)
+                        else:
+                            log.warning("CoinGecko rate limit: all retries exhausted, skipping scan")
+                    else:
+                        log.warning("CoinGecko unexpected status %d", resp.status)
+                        break
+        except asyncio.TimeoutError:
+            log.warning("CoinGecko timeout (attempt %d/3)", attempt + 1)
+        except Exception as e:
+            log.error("CoinGecko error: %s", e)
+            break
     return {"success": False}
+
+async def get_crypto_data(question: str) -> dict:
+    """
+    Returns crypto price data for the coin mentioned in `question`.
+    Results are cached per-coin for CRYPTO_CACHE_TTL_SECONDS to avoid
+    hammering the CoinGecko free-tier rate limit across many markets.
+    """
+    coingecko_id, coin_symbol = _parse_coin(question)
+
+    async with _crypto_lock:
+        cached = _crypto_cache.get(coingecko_id)
+        if cached:
+            age = (now() - cached["fetched_at"]).total_seconds()
+            if age < CRYPTO_CACHE_TTL_SECONDS:
+                log.debug("CoinGecko cache hit for %s (age %.0fs)", coingecko_id, age)
+                return cached["data"]
+
+        # Cache miss or stale — fetch fresh data
+        result = await _fetch_coingecko(coingecko_id, coin_symbol)
+        if result["success"]:
+            _crypto_cache[coingecko_id] = {"data": result, "fetched_at": now()}
+        return result
 
 async def get_sports_odds(question, odds_api_key):
     if not odds_api_key:
