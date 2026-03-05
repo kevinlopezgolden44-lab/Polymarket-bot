@@ -27,7 +27,7 @@ from telegram import (
 
 CONFIG = {
     "check_interval_seconds": 30,
-    "min_score_for_alert": 70,
+    "min_score_for_alert": 85,
     "log_opportunity_threshold": 40,
     "markets_per_page": 100,
     "max_pages": 50,
