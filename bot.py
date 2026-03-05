@@ -301,6 +301,31 @@ async def main():
                 opportunities = []
 
                 for market in active_markets:
+                    question_lower = market.get("question", "").lower()
+
+                    # Skip low-edge categories
+                    esports_keywords = [
+                        "counter-strike", "cs2", "valorant", "dota", "league of legends",
+                        "lol:", "bo3", "bo5", "esport", "gaming league", "blast",
+                        "esl", "faceit", "dreamhack", "iem ", "majors:"
+                    ]
+                    weather_keywords = [
+                        "temperature", "rainfall", "precipitation", "hurricane",
+                        "tornado", "snowfall", "weather", "degrees", "fahrenheit",
+                        "celsius", "highest temp", "lowest temp", "wind speed"
+                    ]
+                    tennis_keywords = [
+                        "atp ", "wta ", "open tennis", "wimbledon",
+                        "french open", "us open tennis", "roland garros"
+                    ]
+
+                    if any(kw in question_lower for kw in esports_keywords):
+                        continue
+                    if any(kw in question_lower for kw in weather_keywords):
+                        continue
+                    if any(kw in question_lower for kw in tennis_keywords):
+                        continue
+
                     result = score_opportunity(
                         market,
                         all_markets=active_markets,
