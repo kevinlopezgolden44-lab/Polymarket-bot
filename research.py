@@ -12,7 +12,60 @@ def now():
 # ── MODULE-LEVEL CACHE ─────────────────────────────────────────────────────────
 _crypto_cache: dict = {}          # coingecko_id -> {"data": ..., "fetched_at": datetime}
 _crypto_lock = asyncio.Lock()     # prevents simultaneous duplicate requests
-CRYPTO_CACHE_TTL_SECONDS = 120   # reuse data for 2 minutes before re-fetching
+CRYPTO_CACHE_TTL_SECONDS = 300   # reuse data for 5 minutes before re-fetching
+
+ALL_COINS = {
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
+    "ripple": "XRP",
+}
+
+async def prefetch_all_crypto():
+    """
+    Fetch all tracked coins in a SINGLE CoinGecko request.
+    Call this once at the start of each scan loop so individual
+    market lookups never touch the API mid-scan.
+    """
+    ids = ",".join(ALL_COINS.keys())
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=" + ids +
+        "&vs_currencies=usd&include_24hr_change=true"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    fetched_at = now()
+                    async with _crypto_lock:
+                        for coingecko_id, symbol in ALL_COINS.items():
+                            asset = data.get(coingecko_id, {})
+                            if not asset:
+                                continue
+                            price = float(asset.get("usd", 0))
+                            change_24h = float(asset.get("usd_24h_change", 0))
+                            _crypto_cache[coingecko_id] = {
+                                "fetched_at": fetched_at,
+                                "data": {
+                                    "coin": symbol,
+                                    "price": price,
+                                    "change_24h": round(change_24h, 2),
+                                    "direction": "UP" if change_24h > 0 else "DOWN",
+                                    "success": True,
+                                }
+                            }
+                    log.info("CoinGecko prefetch OK: %s", ", ".join(ALL_COINS.keys()))
+                    return True
+                elif resp.status == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 60))
+                    log.warning("CoinGecko prefetch rate limited - retry after %ds", retry_after)
+                else:
+                    log.warning("CoinGecko prefetch status %d", resp.status)
+    except Exception as e:
+        log.error("CoinGecko prefetch error: %s", e)
+    return False
 
 async def get_fear_greed():
     try:
@@ -67,46 +120,37 @@ def _parse_coin(question: str) -> tuple[str, str]:
     return "bitcoin", "BTC"
 
 async def _fetch_coingecko(coingecko_id: str, coin_symbol: str) -> dict:
-    """Raw fetch from CoinGecko with retry-after support. Returns success dict or {"success": False}."""
+    """
+    Single-coin fallback fetch — only called on a cache miss.
+    Under normal operation prefetch_all_crypto() fills the cache
+    before any market scan, so this path should rarely be hit.
+    """
     url = (
         "https://api.coingecko.com/api/v3/simple/price"
         "?ids=" + coingecko_id +
         "&vs_currencies=usd&include_24hr_change=true"
     )
-    for attempt in range(3):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        asset = data.get(coingecko_id, {})
-                        price = float(asset.get("usd", 0))
-                        change_24h = float(asset.get("usd_24h_change", 0))
-                        return {
-                            "coin": coin_symbol,
-                            "price": price,
-                            "change_24h": round(change_24h, 2),
-                            "direction": "UP" if change_24h > 0 else "DOWN",
-                            "success": True,
-                        }
-                    elif resp.status == 429:
-                        retry_after = int(resp.headers.get("Retry-After", 60))
-                        log.warning(
-                            "CoinGecko rate limit hit (attempt %d/3) - waiting %ds",
-                            attempt + 1, retry_after,
-                        )
-                        if attempt < 2:
-                            await asyncio.sleep(retry_after)
-                        else:
-                            log.warning("CoinGecko rate limit: all retries exhausted, skipping scan")
-                    else:
-                        log.warning("CoinGecko unexpected status %d", resp.status)
-                        break
-        except asyncio.TimeoutError:
-            log.warning("CoinGecko timeout (attempt %d/3)", attempt + 1)
-        except Exception as e:
-            log.error("CoinGecko error: %s", e)
-            break
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    asset = data.get(coingecko_id, {})
+                    price = float(asset.get("usd", 0))
+                    change_24h = float(asset.get("usd_24h_change", 0))
+                    return {
+                        "coin": coin_symbol,
+                        "price": price,
+                        "change_24h": round(change_24h, 2),
+                        "direction": "UP" if change_24h > 0 else "DOWN",
+                        "success": True,
+                    }
+                elif resp.status == 429:
+                    log.warning("CoinGecko fallback rate limited - crypto skipped for this market")
+                else:
+                    log.warning("CoinGecko fallback status %d", resp.status)
+    except Exception as e:
+        log.error("CoinGecko fallback error: %s", e)
     return {"success": False}
 
 async def get_crypto_data(question: str) -> dict:
