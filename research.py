@@ -52,50 +52,25 @@ async def get_fear_greed():
 async def get_crypto_data(question):
     question_lower = question.lower()
     if "ethereum" in question_lower or " eth" in question_lower:
-        coincap_id = "ethereum"
         coingecko_id = "ethereum"
         coin_symbol = "ETH"
     elif "solana" in question_lower or " sol" in question_lower:
-        coincap_id = "solana"
         coingecko_id = "solana"
         coin_symbol = "SOL"
     elif "xrp" in question_lower or "ripple" in question_lower:
-        coincap_id = "xrp"
         coingecko_id = "ripple"
         coin_symbol = "XRP"
     else:
-        coincap_id = "bitcoin"
         coingecko_id = "bitcoin"
         coin_symbol = "BTC"
 
-    async with aiohttp.ClientSession() as session:
-        # Primary: CoinCap
-        try:
-            url = "https://api.coincap.io/v2/assets/" + coincap_id
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    asset = data.get("data", {})
-                    price = float(asset.get("priceUsd", 0))
-                    change_24h = float(asset.get("changePercent24Hr", 0))
-                    return {
-                        "coin": coin_symbol,
-                        "price": price,
-                        "change_24h": round(change_24h, 2),
-                        "direction": "UP" if change_24h > 0 else "DOWN",
-                        "source": "coincap",
-                        "success": True
-                    }
-        except Exception as e:
-            log.warning("CoinCap error: %s - trying CoinGecko fallback", e)
-
-        # Fallback: CoinGecko
-        try:
-            url = (
-                "https://api.coingecko.com/api/v3/simple/price"
-                "?ids=" + coingecko_id +
-                "&vs_currencies=usd&include_24hr_change=true"
-            )
+    try:
+        url = (
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=" + coingecko_id +
+            "&vs_currencies=usd&include_24hr_change=true"
+        )
+        async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -107,12 +82,12 @@ async def get_crypto_data(question):
                         "price": price,
                         "change_24h": round(change_24h, 2),
                         "direction": "UP" if change_24h > 0 else "DOWN",
-                        "source": "coingecko",
                         "success": True
                     }
-        except Exception as e:
-            log.error("CoinGecko fallback error: %s", e)
-
+                elif resp.status == 429:
+                    log.warning("CoinGecko rate limit hit - crypto analysis skipped this scan")
+    except Exception as e:
+        log.error("CoinGecko error: %s", e)
     return {"success": False}
 
 async def get_sports_odds(question, odds_api_key):
