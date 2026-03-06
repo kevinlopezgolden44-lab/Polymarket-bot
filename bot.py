@@ -10,7 +10,8 @@ from database import (
     init_db, get_risk_state, get_dynamic_limits, reset_loss_streak,
     log_alert, log_opportunity, update_price_history, get_price_history,
     log_sentiment, get_daily_stats, get_alerted_markets,
-    get_logged_opportunities, check_resolutions
+    get_logged_opportunities, check_resolutions,
+    update_open_positions, run_weekly_backtest
 )
 from scoring import score_opportunity, is_market_active, detect_category
 from research import get_fear_greed, build_research_summary, get_crypto_data
@@ -253,6 +254,9 @@ async def main():
             if (current_time.weekday() == CONFIG["weekly_analysis_day"] and
                     current_time.date() != last_weekly_date):
                 await send_weekly_analysis(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
+                # Run backtest and send results
+                backtest_report = await run_weekly_backtest(conn)
+                await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, backtest_report)
                 last_weekly_date = current_time.date()
 
             resolution_key = str(current_time.date()) + "_" + str(current_time.hour)
@@ -270,6 +274,22 @@ async def main():
                         "Resolved " + str(resolved_count) + " markets\n"
                         "Type /status to see updated win rate!"
                     )
+
+            # Monitor open positions for take-profit / stop-loss
+            closed_positions = await update_open_positions(conn)
+            for pos in closed_positions:
+                emoji = "✅" if pos["profitable"] else "❌"
+                direction = "+" if pos["return_pct"] >= 0 else ""
+                await send_message(
+                    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f"{emoji} <b>Position Closed [{pos['outcome_type']}]</b>\n\n"
+                    f"{pos['question'][:80]}\n\n"
+                    f"Entry: {round(pos['entry_price']*100)}¢  →  "
+                    f"Exit: {round(pos['exit_price']*100)}¢\n"
+                    f"Return: {direction}{pos['return_pct']}%  "
+                    f"(Peak was +{pos['peak_return_pct']}%)\n"
+                    f"Reason: {pos['exit_reason']}"
+                )
 
             # Load upcoming events for this scan
             upcoming_events = await load_upcoming_events(conn)
@@ -410,6 +430,26 @@ async def main():
                     opp["confidence_tier"] = calculate_confidence_tier(
                         score, confirming, contradicting
                     )
+
+                    # Build signals_fired string for backtest tracking
+                    fired = []
+                    if opp.get("momentum", {}).get("signal") in ["RISING", "STRONG_RISING"]:
+                        fired.append("momentum_up")
+                    if opp.get("momentum", {}).get("signal") in ["FALLING", "STRONG_FALLING"]:
+                        fired.append("momentum_down")
+                    if opp.get("velocity_alert"):
+                        fired.append("velocity")
+                    if opp.get("lag_detected"):
+                        fired.append("lag_detected")
+                    if opp.get("inconsistencies"):
+                        fired.append("cross_market")
+                    if opp.get("upcoming_events"):
+                        fired.append("event_timing")
+                    if opp.get("liquidity_warning"):
+                        fired.append("low_liquidity")
+                    if opp.get("ambiguity_warning"):
+                        fired.append("ambiguous")
+                    opp["signals_fired"] = ",".join(fired)
 
                     # Log all 40+ opportunities silently
                     if market_id not in logged_opportunities:
