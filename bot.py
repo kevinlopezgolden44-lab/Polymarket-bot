@@ -3,7 +3,7 @@ import aiohttp
 import logging
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncpg
 
 from database import (
@@ -11,10 +11,11 @@ from database import (
     log_alert, log_opportunity, update_price_history, get_price_history,
     log_sentiment, get_daily_stats, get_alerted_markets,
     get_logged_opportunities, check_resolutions,
-    update_open_positions, run_weekly_backtest
+    update_open_positions, run_weekly_backtest,
+    record_alert_snapshot, cleanup_old_snapshots
 )
 from scoring import score_opportunity, is_market_active, detect_category
-from research import get_fear_greed, build_research_summary, get_crypto_data
+from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
     analyze_liquidity, check_cross_market_consistency,
@@ -256,6 +257,7 @@ async def main():
                 await send_weekly_analysis(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
                 backtest_report = await run_weekly_backtest(conn)
                 await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, backtest_report)
+                await cleanup_old_snapshots(conn)
                 last_weekly_date = current_time.date()
 
             resolution_key = str(current_time.date()) + "_" + str(current_time.hour)
@@ -294,6 +296,9 @@ async def main():
             upcoming_events = await load_upcoming_events(conn)
 
             # Main market scan
+            # Pre-fetch all coin prices in one request before scanning
+            await prefetch_all_crypto()
+
             log.info("Scanning Polymarket markets...")
             markets = await fetch_all_markets()
 
@@ -367,6 +372,38 @@ async def main():
                     market_id = str(market.get("id", question[:50]))
                     volume = float(market.get("volumeNum", 0) or 0)
 
+                    # ── Rich context data collection ──────────────────────
+                    # Days to resolution
+                    days_to_resolution = None
+                    end_date_raw = market.get("endDate") or market.get("end_date")
+                    if end_date_raw:
+                        try:
+                            from datetime import timezone
+                            end_dt = datetime.fromisoformat(
+                                str(end_date_raw).replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            days_to_resolution = round(
+                                (end_dt - now()).total_seconds() / 86400, 1
+                            )
+                        except Exception:
+                            pass
+
+                    # Bid/ask spread from market data
+                    bid_price = float(market.get("bestBid", 0) or 0) or None
+                    ask_price = float(market.get("bestAsk", 0) or 0) or None
+
+                    # Score breakdown for backtest analysis
+                    score_breakdown = {
+                        "base": 50,
+                        "liquidity": result["signals"].get("liquidity", {}).get("liquid", True) and 5 or -20,
+                        "momentum": result["signals"].get("momentum", {}).get("signal", "STABLE"),
+                        "velocity": result["signals"].get("velocity", {}).get("fast_move", False),
+                        "ambiguity": bool(result["signals"].get("ambiguity")),
+                        "lag": bool(result["signals"].get("lag")),
+                        "age_hours": market_age,
+                        "final_score": score,
+                    }
+
                     opp = {
                         "id": market_id,
                         "question": question,
@@ -376,7 +413,11 @@ async def main():
                         "volume": volume,
                         "age": market_age,
                         "category": category,
-                        "confidence_tier": "MEDIUM"
+                        "confidence_tier": "MEDIUM",
+                        "days_to_resolution": days_to_resolution,
+                        "bid_price": bid_price,
+                        "ask_price": ask_price,
+                        "score_breakdown": score_breakdown,
                     }
 
                     # Run analysis modules
@@ -416,6 +457,32 @@ async def main():
                             if velocity["fast_move"]:
                                 opp["velocity_alert"] = velocity["alert"]
                                 confirming += 1
+
+                            # Extract price context: what was price 1d/3d/7d ago
+                            try:
+                                now_ts = now()
+                                def price_n_days_ago(h, days):
+                                    cutoff = now_ts - timedelta(hours=days*24)
+                                    candidates = [r for r in h if r["recorded_at"] <= cutoff]
+                                    return float(candidates[0]["yes_price"]) if candidates else None
+                                opp["price_1d_ago"] = price_n_days_ago(history, 1)
+                                opp["price_3d_ago"] = price_n_days_ago(history, 3)
+                                opp["price_7d_ago"] = price_n_days_ago(history, 7)
+                            except Exception:
+                                pass
+
+                        # Record dense snapshot for post-alert price curve
+                        alert_row = await conn.fetchrow(
+                            "SELECT id, alerted_at FROM alerts WHERE market_id=$1 ORDER BY alerted_at DESC LIMIT 1",
+                            market_id
+                        )
+                        if alert_row:
+                            await record_alert_snapshot(
+                                conn, alert_row["id"], market_id, yes_price,
+                                alert_row["alerted_at"],
+                                bid_price=opp.get("bid_price"),
+                                ask_price=opp.get("ask_price")
+                            )
 
                     # Polymarket lag detection for crypto
                     if category == "Crypto":

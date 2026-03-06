@@ -122,7 +122,20 @@ async def init_db(conn):
             peak_return_pct FLOAT,
             exit_return_pct FLOAT,
             exit_reason TEXT,
-            signals_fired TEXT
+            signals_fired TEXT,
+            -- Rich data collection for backtest & CLOB strategy development
+            days_to_resolution FLOAT,
+            price_7d_ago FLOAT,
+            price_3d_ago FLOAT,
+            price_1d_ago FLOAT,
+            score_breakdown TEXT,
+            bid_price FLOAT,
+            ask_price FLOAT,
+            alerts_in_last_24h INTEGER,
+            active_open_positions_count INTEGER,
+            peak_reached_at TIMESTAMP,
+            first_profitable_at TIMESTAMP,
+            last_profitable_at TIMESTAMP
         )
     """)
 
@@ -145,6 +158,58 @@ async def init_db(conn):
         )
     """)
 
+    # Paper trading simulation — resets daily, $200 starting bankroll
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sim_trades (
+            id SERIAL PRIMARY KEY,
+            sim_date TEXT NOT NULL,
+            alert_id INTEGER REFERENCES alerts(id),
+            market_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            category TEXT,
+            confidence_tier TEXT,
+            entry_price FLOAT NOT NULL,
+            stake FLOAT NOT NULL,
+            exit_price FLOAT,
+            return_pct FLOAT,
+            pnl FLOAT,
+            outcome_type TEXT,
+            exit_reason TEXT,
+            opened_at TIMESTAMP NOT NULL,
+            closed_at TIMESTAMP,
+            is_open BOOLEAN DEFAULT TRUE
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sim_daily_log (
+            id SERIAL PRIMARY KEY,
+            sim_date TEXT NOT NULL UNIQUE,
+            starting_bankroll FLOAT NOT NULL DEFAULT 200.0,
+            ending_bankroll FLOAT,
+            total_staked FLOAT DEFAULT 0,
+            total_pnl FLOAT DEFAULT 0,
+            trades_placed INTEGER DEFAULT 0,
+            trades_won INTEGER DEFAULT 0,
+            trades_lost INTEGER DEFAULT 0,
+            busted BOOLEAN DEFAULT FALSE,
+            busted_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )
+    """)
+
+    # Dense price tracking for 48h after each alert — reveals optimal exit windows
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_price_snapshots (
+            id SERIAL PRIMARY KEY,
+            alert_id INTEGER REFERENCES alerts(id),
+            market_id TEXT NOT NULL,
+            yes_price FLOAT NOT NULL,
+            bid_price FLOAT,
+            ask_price FLOAT,
+            recorded_at TIMESTAMP NOT NULL,
+            minutes_since_alert INTEGER
+        )
+    """)
 
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS opportunities_log (
@@ -223,6 +288,18 @@ async def init_db(conn):
         ("exit_reason", "TEXT"),
         ("signals_fired", "TEXT"),
         ("is_backfilled", "BOOLEAN"),
+        ("days_to_resolution", "FLOAT"),
+        ("price_7d_ago", "FLOAT"),
+        ("price_3d_ago", "FLOAT"),
+        ("price_1d_ago", "FLOAT"),
+        ("score_breakdown", "TEXT"),
+        ("bid_price", "FLOAT"),
+        ("ask_price", "FLOAT"),
+        ("alerts_in_last_24h", "INTEGER"),
+        ("active_open_positions_count", "INTEGER"),
+        ("peak_reached_at", "TIMESTAMP"),
+        ("first_profitable_at", "TIMESTAMP"),
+        ("last_profitable_at", "TIMESTAMP"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -292,12 +369,34 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
     fg_regime = fear_greed.get("regime") if fear_greed else None
     entry_price = opportunity["yes_price"]
     signals_fired = opportunity.get("signals_fired", "")
+
+    # Count context metrics
+    alerts_24h = await conn.fetchval("""
+        SELECT COUNT(*) FROM alerts
+        WHERE alerted_at > NOW() - INTERVAL '24 hours'
+    """)
+    open_positions = await conn.fetchval("""
+        SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE
+    """)
+
+    import json as _json
+    score_breakdown_str = None
+    if opportunity.get("score_breakdown"):
+        try:
+            score_breakdown_str = _json.dumps(opportunity["score_breakdown"])
+        except Exception:
+            pass
+
     alert_id = await conn.fetchval("""
         INSERT INTO alerts (market_id, question, yes_price, score, reason, volume, alerted_at,
                            fear_greed_score, fear_greed_regime, market_age_hours,
                            score_components, confidence_tier, category,
-                           entry_price, peak_price, signals_fired)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                           entry_price, peak_price, signals_fired,
+                           days_to_resolution, price_7d_ago, price_3d_ago, price_1d_ago,
+                           score_breakdown, bid_price, ask_price,
+                           alerts_in_last_24h, active_open_positions_count)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                $17,$18,$19,$20,$21,$22,$23,$24,$25)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -305,8 +404,17 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         fg_score, fg_regime, market_age,
         opportunity["reason"], opportunity.get("confidence_tier", "Medium"),
         opportunity.get("category", "General"),
-        entry_price, entry_price,   # peak_price starts equal to entry
-        signals_fired
+        entry_price, entry_price,
+        signals_fired,
+        opportunity.get("days_to_resolution"),
+        opportunity.get("price_7d_ago"),
+        opportunity.get("price_3d_ago"),
+        opportunity.get("price_1d_ago"),
+        score_breakdown_str,
+        opportunity.get("bid_price"),
+        opportunity.get("ask_price"),
+        alerts_24h,
+        open_positions
     )
     # Open a trade position for this alert so we can monitor it
     await conn.execute("""
@@ -449,6 +557,9 @@ async def update_open_positions(conn):
                         UPDATE alerts SET peak_price=$1, peak_return_pct=$2
                         WHERE id=$3
                     """, new_peak, peak_return, pos["alert_id"])
+
+                    # Track timing — when peak hit, when first/last profitable
+                    await update_position_timing(conn, pos["alert_id"], current_price, entry)
 
                     # Check market resolved
                     market_closed = market.get("closed", False)
@@ -719,3 +830,326 @@ async def run_weekly_backtest(conn):
     ] + outcome_lines
 
     return "\n".join(lines)
+
+# ── SIMULATION ENGINE ──────────────────────────────────────────────────────────
+
+SIM_DAILY_BUDGET     = 200.0
+SIM_STAKE_HIGH       = 40.0   # HIGH confidence alerts
+SIM_STAKE_MEDIUM     = 25.0   # MEDIUM confidence alerts
+SIM_STAKE_LOW        = 15.0   # LOW confidence alerts
+SIM_TAKE_PROFIT_PCT  = 40.0   # mirror real position management
+SIM_STOP_LOSS_PCT    = -25.0
+
+
+async def get_sim_state(conn):
+    """
+    Returns today's simulation row, creating it if this is the first
+    alert of the day. Bankroll always starts at $200.
+    """
+    today = now().strftime("%Y-%m-%d")
+    row = await conn.fetchrow("SELECT * FROM sim_daily_log WHERE sim_date = $1", today)
+    if not row:
+        await conn.execute("""
+            INSERT INTO sim_daily_log
+                (sim_date, starting_bankroll, ending_bankroll, total_staked,
+                 total_pnl, trades_placed, trades_won, trades_lost,
+                 busted, created_at)
+            VALUES ($1, $2, $2, 0, 0, 0, 0, 0, FALSE, $3)
+        """, today, SIM_DAILY_BUDGET, now())
+        row = await conn.fetchrow("SELECT * FROM sim_daily_log WHERE sim_date = $1", today)
+    return dict(row)
+
+
+async def sim_is_active(conn):
+    """Returns False if today's sim has busted (bankroll at $0)."""
+    state = await get_sim_state(conn)
+    return not state["busted"] and (state["ending_bankroll"] or 0) > 0
+
+
+async def place_sim_trade(conn, alert_id, opp):
+    """
+    Called when a real alert fires. Places a hypothetical stake if the
+    sim is still active today. Stake size is determined by confidence tier.
+    Returns the sim trade row id, or None if sim is busted/skipped.
+    """
+    if not await sim_is_active(conn):
+        return None
+
+    today = now().strftime("%Y-%m-%d")
+    state = await get_sim_state(conn)
+    bankroll = state["ending_bankroll"] or 0.0
+
+    tier = opp.get("confidence_tier", "MEDIUM").upper()
+    raw_stake = {
+        "HIGH":   SIM_STAKE_HIGH,
+        "MEDIUM": SIM_STAKE_MEDIUM,
+        "LOW":    SIM_STAKE_LOW,
+    }.get(tier, SIM_STAKE_MEDIUM)
+
+    stake = min(raw_stake, bankroll)  # never bet more than we have
+    if stake <= 0:
+        return None
+
+    new_bankroll = round(bankroll - stake, 2)
+
+    sim_id = await conn.fetchval("""
+        INSERT INTO sim_trades
+            (sim_date, alert_id, market_id, question, category,
+             confidence_tier, entry_price, stake, opened_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING id
+    """, today, alert_id, opp["id"], opp["question"][:200],
+        opp.get("category", "General"), tier,
+        opp["yes_price"], stake, now())
+
+    await conn.execute("""
+        UPDATE sim_daily_log
+        SET ending_bankroll = $1,
+            total_staked    = total_staked + $2,
+            trades_placed   = trades_placed + 1
+        WHERE sim_date = $3
+    """, new_bankroll, stake, today)
+
+    log.info("SIM trade placed | %s | stake=$%.2f | bankroll=$%.2f",
+             tier, stake, new_bankroll)
+    return sim_id
+
+
+async def close_sim_trade(conn, market_id, current_price, exit_reason, outcome_type):
+    """
+    Called whenever a real trade_position closes (take-profit, stop-loss,
+    or resolution). Finds the matching open sim trade, calculates P&L,
+    updates bankroll, and checks for bust.
+    Returns dict with result info, or None if no open sim trade found.
+    """
+    today = now().strftime("%Y-%m-%d")
+
+    sim_trade = await conn.fetchrow("""
+        SELECT * FROM sim_trades
+        WHERE market_id = $1 AND is_open = TRUE AND sim_date = $2
+    """, market_id, today)
+
+    if not sim_trade:
+        return None
+
+    entry  = sim_trade["entry_price"]
+    stake  = sim_trade["stake"]
+    return_pct = round((current_price - entry) / entry * 100, 2) if entry else 0
+    pnl    = round(stake * return_pct / 100, 2)
+    profitable = outcome_type in ("FULL_WIN", "PARTIAL_WIN")
+
+    await conn.execute("""
+        UPDATE sim_trades
+        SET exit_price  = $1,
+            return_pct  = $2,
+            pnl         = $3,
+            outcome_type = $4,
+            exit_reason  = $5,
+            closed_at    = $6,
+            is_open      = FALSE
+        WHERE id = $7
+    """, current_price, return_pct, pnl, outcome_type, exit_reason, now(), sim_trade["id"])
+
+    # Update daily bankroll
+    state = await get_sim_state(conn)
+    new_bankroll = round((state["ending_bankroll"] or 0) + stake + pnl, 2)
+    new_bankroll = max(0.0, new_bankroll)
+    busted = new_bankroll <= 0
+
+    win_delta  = 1 if profitable else 0
+    loss_delta = 0 if profitable else 1
+
+    await conn.execute("""
+        UPDATE sim_daily_log
+        SET ending_bankroll = $1,
+            total_pnl       = total_pnl + $2,
+            trades_won      = trades_won + $3,
+            trades_lost     = trades_lost + $4,
+            busted          = $5,
+            busted_at       = CASE WHEN $5 THEN $6 ELSE busted_at END
+        WHERE sim_date = $7
+    """, new_bankroll, pnl, win_delta, loss_delta, busted, now(), today)
+
+    if busted:
+        log.warning("SIM BUSTED today — bankroll hit $0. Monitoring continues.")
+
+    log.info("SIM closed [%s] return=%.1f%% pnl=$%.2f bankroll=$%.2f%s",
+             outcome_type, return_pct, pnl, new_bankroll, " BUSTED" if busted else "")
+
+    return {
+        "sim_trade_id": sim_trade["id"],
+        "stake": stake,
+        "return_pct": return_pct,
+        "pnl": pnl,
+        "new_bankroll": new_bankroll,
+        "outcome_type": outcome_type,
+        "exit_reason": exit_reason,
+        "busted": busted,
+        "profitable": profitable,
+        "question": sim_trade["question"],
+    }
+
+
+async def get_sim_summary(conn, sim_date=None):
+    """Returns the sim_daily_log row for a given date (default: today)."""
+    date_str = sim_date or now().strftime("%Y-%m-%d")
+    row = await conn.fetchrow(
+        "SELECT * FROM sim_daily_log WHERE sim_date = $1", date_str
+    )
+    return dict(row) if row else None
+
+
+async def get_sim_trades_for_date(conn, sim_date=None):
+    """Returns all sim trades for a given date."""
+    date_str = sim_date or now().strftime("%Y-%m-%d")
+    rows = await conn.fetch(
+        "SELECT * FROM sim_trades WHERE sim_date = $1 ORDER BY opened_at", date_str
+    )
+    return [dict(r) for r in rows]
+
+
+async def run_sim_weekly_report(conn):
+    """
+    Computes a 7-day simulation performance report.
+    Called alongside the weekly backtest every Sunday.
+    """
+    rows = await conn.fetch("""
+        SELECT * FROM sim_daily_log
+        WHERE created_at > NOW() - INTERVAL '7 days'
+        ORDER BY sim_date
+    """)
+    if not rows:
+        return "📊 Sim Report: No data yet for the past 7 days."
+
+    total_pnl     = sum(r["total_pnl"] or 0 for r in rows)
+    total_staked  = sum(r["total_staked"] or 0 for r in rows)
+    total_trades  = sum(r["trades_placed"] or 0 for r in rows)
+    total_wins    = sum(r["trades_won"] or 0 for r in rows)
+    bust_days     = sum(1 for r in rows if r["busted"])
+    win_rate      = round(total_wins / total_trades * 100, 1) if total_trades else 0
+    roi           = round(total_pnl / total_staked * 100, 1) if total_staked else 0
+
+    day_lines = []
+    for r in rows:
+        pnl    = r["total_pnl"] or 0
+        br     = r["ending_bankroll"] or 0
+        busted = " 💀 BUSTED" if r["busted"] else ""
+        sign   = "+" if pnl >= 0 else ""
+        day_lines.append(
+            f"  {r['sim_date']}: {sign}${round(pnl,2)} "
+            f"({r['trades_won']}/{r['trades_placed']} wins) "
+            f"→ ${round(br,2)}{busted}"
+        )
+
+    sign = "+" if total_pnl >= 0 else ""
+    lines = [
+        "🎮 <b>Weekly Sim Report ($200/day)</b>",
+        "",
+        f"<b>7-Day Summary:</b>",
+        f"  Total P&L: {sign}${round(total_pnl, 2)}",
+        f"  Total Staked: ${round(total_staked, 2)}",
+        f"  ROI on staked: {sign}{roi}%",
+        f"  Win Rate: {win_rate}% ({total_wins}/{total_trades})",
+        f"  Bust Days: {bust_days}/7",
+        "",
+        "<b>Daily Breakdown:</b>",
+    ] + day_lines
+
+    return "\n".join(lines)
+
+# ── RICH DATA COLLECTION FUNCTIONS ────────────────────────────────────────────
+
+async def record_alert_snapshot(conn, alert_id, market_id, yes_price,
+                                  alerted_at, bid_price=None, ask_price=None):
+    """
+    Records a price snapshot for an alerted market every 15 minutes
+    for 48 hours after the alert fired. Builds the post-alert price
+    curve needed to identify optimal exit windows.
+    Only records if at least 14 minutes have passed since last snapshot.
+    """
+    last = await conn.fetchrow("""
+        SELECT recorded_at FROM alert_price_snapshots
+        WHERE alert_id = $1 ORDER BY recorded_at DESC LIMIT 1
+    """, alert_id)
+
+    if last:
+        mins_since = (now() - last["recorded_at"]).total_seconds() / 60
+        if mins_since < 14:
+            return
+
+    # Stop snapshotting after 48 hours
+    hours_since_alert = (now() - alerted_at).total_seconds() / 3600
+    if hours_since_alert > 48:
+        return
+
+    minutes_since = int((now() - alerted_at).total_seconds() / 60)
+
+    await conn.execute("""
+        INSERT INTO alert_price_snapshots
+            (alert_id, market_id, yes_price, bid_price, ask_price,
+             recorded_at, minutes_since_alert)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+    """, alert_id, market_id, yes_price, bid_price, ask_price, now(), minutes_since)
+
+
+async def update_position_timing(conn, alert_id, current_price, entry_price):
+    """
+    Called every scan for open positions. Tracks:
+    - peak_reached_at: when the highest price was seen
+    - first_profitable_at: first time price exceeded entry
+    - last_profitable_at: most recent time price was above entry
+    These three timestamps reveal the shape of the opportunity window.
+    """
+    alert = await conn.fetchrow("""
+        SELECT peak_price, peak_reached_at, first_profitable_at, entry_price
+        FROM alerts WHERE id = $1
+    """, alert_id)
+
+    if not alert:
+        return
+
+    updates = {}
+    current_peak = alert["peak_price"] or entry_price
+
+    # Update peak timing if new high
+    if current_price > current_peak:
+        updates["peak_reached_at"] = now()
+
+    # Track profitable window
+    if current_price > entry_price:
+        if not alert["first_profitable_at"]:
+            updates["first_profitable_at"] = now()
+        updates["last_profitable_at"] = now()
+
+    if updates:
+        set_clauses = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(updates))
+        values = list(updates.values())
+        await conn.execute(
+            f"UPDATE alerts SET {set_clauses} WHERE id = $1",
+            alert_id, *values
+        )
+
+
+async def get_alert_price_curve(conn, alert_id):
+    """Returns the full post-alert price curve for a given alert."""
+    rows = await conn.fetch("""
+        SELECT yes_price, bid_price, ask_price, recorded_at, minutes_since_alert
+        FROM alert_price_snapshots
+        WHERE alert_id = $1
+        ORDER BY recorded_at ASC
+    """, alert_id)
+    return [dict(r) for r in rows]
+
+
+async def cleanup_old_snapshots(conn):
+    """
+    Removes snapshots older than 30 days to keep the table lean.
+    Called weekly.
+    """
+    deleted = await conn.fetchval("""
+        DELETE FROM alert_price_snapshots
+        WHERE recorded_at < NOW() - INTERVAL '30 days'
+        RETURNING id
+    """)
+    if deleted:
+        log.info("Cleaned up old price snapshots")
