@@ -8,6 +8,91 @@ log = logging.getLogger(__name__)
 def now():
     return datetime.utcnow()
 
+
+async def backfill_outcome_types(conn):
+    """
+    One-time migration for resolved alerts that predate the outcome_type
+    and return tracking columns. Safe to run on every startup — it only
+    touches rows where outcome_type IS NULL and outcome IS NOT NULL.
+
+    Derives:
+      entry_price      — from yes_price (the price at alert time)
+      exit_price       — from outcomePrices via Polymarket API (YES=0.99, NO=0.01)
+      exit_return_pct  — (exit - entry) / entry * 100
+      peak_price       — best estimate: exit_price if win, entry_price if loss
+                         (true peak requires price history; this is a safe approximation)
+      peak_return_pct  — same basis as above
+      outcome_type     — FULL_WIN / LOSS derived from outcome + entry_price
+      exit_reason      — RESOLVED (all backfilled trades were held to resolution)
+    """
+    rows = await conn.fetch("""
+        SELECT id, yes_price, outcome, profitable
+        FROM alerts
+        WHERE outcome IS NOT NULL
+        AND outcome_type IS NULL
+    """)
+
+    if not rows:
+        log.info("Backfill: nothing to migrate")
+        return
+
+    log.info("Backfilling %d resolved alerts with outcome_type + return data...", len(rows))
+    updated = 0
+
+    for row in rows:
+        try:
+            entry = float(row["yes_price"])
+            outcome = row["outcome"]          # "YES", "NO", or "PARTIAL"
+            profitable = row["profitable"]
+
+            # Derive exit price from outcome
+            if outcome == "YES":
+                exit_price = 0.99
+            elif outcome == "NO":
+                exit_price = 0.01
+            else:
+                # PARTIAL — we don't know exact exit, use entry as neutral fallback
+                exit_price = entry
+
+            # Derive outcome_type
+            if outcome == "YES":
+                outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
+            elif outcome == "NO":
+                outcome_type = "FULL_WIN" if entry > 0.5 else "LOSS"
+            else:
+                outcome_type = "PARTIAL_WIN" if profitable else "LOSS"
+
+            # Calculate returns
+            if entry and entry > 0:
+                exit_return_pct = round((exit_price - entry) / entry * 100, 2)
+            else:
+                exit_return_pct = 0.0
+
+            # Peak: if it was a win, peak = exit. If loss, peak = entry (we never saw higher).
+            # This is conservative but honest — real peaks need price history.
+            peak_price = exit_price if outcome_type in ("FULL_WIN", "PARTIAL_WIN") else entry
+            peak_return_pct = round((peak_price - entry) / entry * 100, 2) if entry else 0.0
+
+            await conn.execute("""
+                UPDATE alerts
+                SET outcome_type    = $1,
+                    entry_price     = $2,
+                    exit_price      = $3,
+                    exit_return_pct = $4,
+                    peak_price      = $5,
+                    peak_return_pct = $6,
+                    exit_reason     = 'RESOLVED'
+                WHERE id = $7
+            """, outcome_type, entry, exit_price,
+                exit_return_pct, peak_price, peak_return_pct,
+                row["id"])
+            updated += 1
+
+        except Exception as e:
+            log.warning("Backfill error on alert id=%s: %s", row["id"], e)
+
+    log.info("Backfill complete: %d alerts updated", updated)
+
 async def init_db(conn):
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
@@ -58,6 +143,46 @@ async def init_db(conn):
             is_open BOOLEAN DEFAULT TRUE
         )
     """)
+
+    # Paper trading simulation — resets daily, $200 starting bankroll
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sim_trades (
+            id SERIAL PRIMARY KEY,
+            sim_date TEXT NOT NULL,
+            alert_id INTEGER REFERENCES alerts(id),
+            market_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            category TEXT,
+            confidence_tier TEXT,
+            entry_price FLOAT NOT NULL,
+            stake FLOAT NOT NULL,
+            exit_price FLOAT,
+            return_pct FLOAT,
+            pnl FLOAT,
+            outcome_type TEXT,
+            exit_reason TEXT,
+            opened_at TIMESTAMP NOT NULL,
+            closed_at TIMESTAMP,
+            is_open BOOLEAN DEFAULT TRUE
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sim_daily_log (
+            id SERIAL PRIMARY KEY,
+            sim_date TEXT NOT NULL UNIQUE,
+            starting_bankroll FLOAT NOT NULL DEFAULT 200.0,
+            ending_bankroll FLOAT,
+            total_staked FLOAT DEFAULT 0,
+            total_pnl FLOAT DEFAULT 0,
+            trades_placed INTEGER DEFAULT 0,
+            trades_won INTEGER DEFAULT 0,
+            trades_lost INTEGER DEFAULT 0,
+            busted BOOLEAN DEFAULT FALSE,
+            busted_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )
+    """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS opportunities_log (
             id SERIAL PRIMARY KEY,
@@ -143,6 +268,9 @@ async def init_db(conn):
     await conn.execute("ALTER TABLE sentiment_history ADD COLUMN IF NOT EXISTS trend TEXT")
 
     log.info("Database tables ready")
+
+    # Backfill any resolved trades missing outcome_type / return data
+    await backfill_outcome_types(conn)
 
 async def get_risk_state(conn):
     today = now().strftime("%Y-%m-%d")
@@ -411,6 +539,13 @@ async def update_open_positions(conn):
                             "outcome_type": outcome_type,
                             "profitable": profitable,
                         })
+
+                        # Mirror close in simulation
+                        sim_result = await close_sim_trade(
+                            conn, pos["market_id"], current_price, exit_reason, outcome_type
+                        )
+                        if sim_result:
+                            closed[-1]["sim_result"] = sim_result
                         log.info(
                             "Position closed [%s] %s | entry=%.2f exit=%.2f return=%.1f%%",
                             outcome_type, pos["question"][:40],
@@ -614,5 +749,231 @@ async def run_weekly_backtest(conn):
         "",
         "<b>Outcome Breakdown:</b>",
     ] + outcome_lines
+
+    return "\n".join(lines)
+
+# ── SIMULATION ENGINE ──────────────────────────────────────────────────────────
+
+SIM_DAILY_BUDGET     = 200.0
+SIM_STAKE_HIGH       = 40.0   # HIGH confidence alerts
+SIM_STAKE_MEDIUM     = 25.0   # MEDIUM confidence alerts
+SIM_STAKE_LOW        = 15.0   # LOW confidence alerts
+SIM_TAKE_PROFIT_PCT  = 40.0   # mirror real position management
+SIM_STOP_LOSS_PCT    = -25.0
+
+
+async def get_sim_state(conn):
+    """
+    Returns today's simulation row, creating it if this is the first
+    alert of the day. Bankroll always starts at $200.
+    """
+    today = now().strftime("%Y-%m-%d")
+    row = await conn.fetchrow("SELECT * FROM sim_daily_log WHERE sim_date = $1", today)
+    if not row:
+        await conn.execute("""
+            INSERT INTO sim_daily_log
+                (sim_date, starting_bankroll, ending_bankroll, total_staked,
+                 total_pnl, trades_placed, trades_won, trades_lost,
+                 busted, created_at)
+            VALUES ($1, $2, $2, 0, 0, 0, 0, 0, FALSE, $3)
+        """, today, SIM_DAILY_BUDGET, now())
+        row = await conn.fetchrow("SELECT * FROM sim_daily_log WHERE sim_date = $1", today)
+    return dict(row)
+
+
+async def sim_is_active(conn):
+    """Returns False if today's sim has busted (bankroll at $0)."""
+    state = await get_sim_state(conn)
+    return not state["busted"] and (state["ending_bankroll"] or 0) > 0
+
+
+async def place_sim_trade(conn, alert_id, opp):
+    """
+    Called when a real alert fires. Places a hypothetical stake if the
+    sim is still active today. Stake size is determined by confidence tier.
+    Returns the sim trade row id, or None if sim is busted/skipped.
+    """
+    if not await sim_is_active(conn):
+        return None
+
+    today = now().strftime("%Y-%m-%d")
+    state = await get_sim_state(conn)
+    bankroll = state["ending_bankroll"] or 0.0
+
+    tier = opp.get("confidence_tier", "MEDIUM").upper()
+    raw_stake = {
+        "HIGH":   SIM_STAKE_HIGH,
+        "MEDIUM": SIM_STAKE_MEDIUM,
+        "LOW":    SIM_STAKE_LOW,
+    }.get(tier, SIM_STAKE_MEDIUM)
+
+    stake = min(raw_stake, bankroll)  # never bet more than we have
+    if stake <= 0:
+        return None
+
+    new_bankroll = round(bankroll - stake, 2)
+
+    sim_id = await conn.fetchval("""
+        INSERT INTO sim_trades
+            (sim_date, alert_id, market_id, question, category,
+             confidence_tier, entry_price, stake, opened_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING id
+    """, today, alert_id, opp["id"], opp["question"][:200],
+        opp.get("category", "General"), tier,
+        opp["yes_price"], stake, now())
+
+    await conn.execute("""
+        UPDATE sim_daily_log
+        SET ending_bankroll = $1,
+            total_staked    = total_staked + $2,
+            trades_placed   = trades_placed + 1
+        WHERE sim_date = $3
+    """, new_bankroll, stake, today)
+
+    log.info("SIM trade placed | %s | stake=$%.2f | bankroll=$%.2f",
+             tier, stake, new_bankroll)
+    return sim_id
+
+
+async def close_sim_trade(conn, market_id, current_price, exit_reason, outcome_type):
+    """
+    Called whenever a real trade_position closes (take-profit, stop-loss,
+    or resolution). Finds the matching open sim trade, calculates P&L,
+    updates bankroll, and checks for bust.
+    Returns dict with result info, or None if no open sim trade found.
+    """
+    today = now().strftime("%Y-%m-%d")
+
+    sim_trade = await conn.fetchrow("""
+        SELECT * FROM sim_trades
+        WHERE market_id = $1 AND is_open = TRUE AND sim_date = $2
+    """, market_id, today)
+
+    if not sim_trade:
+        return None
+
+    entry  = sim_trade["entry_price"]
+    stake  = sim_trade["stake"]
+    return_pct = round((current_price - entry) / entry * 100, 2) if entry else 0
+    pnl    = round(stake * return_pct / 100, 2)
+    profitable = outcome_type in ("FULL_WIN", "PARTIAL_WIN")
+
+    await conn.execute("""
+        UPDATE sim_trades
+        SET exit_price  = $1,
+            return_pct  = $2,
+            pnl         = $3,
+            outcome_type = $4,
+            exit_reason  = $5,
+            closed_at    = $6,
+            is_open      = FALSE
+        WHERE id = $7
+    """, current_price, return_pct, pnl, outcome_type, exit_reason, now(), sim_trade["id"])
+
+    # Update daily bankroll
+    state = await get_sim_state(conn)
+    new_bankroll = round((state["ending_bankroll"] or 0) + stake + pnl, 2)
+    new_bankroll = max(0.0, new_bankroll)
+    busted = new_bankroll <= 0
+
+    win_delta  = 1 if profitable else 0
+    loss_delta = 0 if profitable else 1
+
+    await conn.execute("""
+        UPDATE sim_daily_log
+        SET ending_bankroll = $1,
+            total_pnl       = total_pnl + $2,
+            trades_won      = trades_won + $3,
+            trades_lost     = trades_lost + $4,
+            busted          = $5,
+            busted_at       = CASE WHEN $5 THEN $6 ELSE busted_at END
+        WHERE sim_date = $7
+    """, new_bankroll, pnl, win_delta, loss_delta, busted, now(), today)
+
+    if busted:
+        log.warning("SIM BUSTED today — bankroll hit $0. Monitoring continues.")
+
+    log.info("SIM closed [%s] return=%.1f%% pnl=$%.2f bankroll=$%.2f%s",
+             outcome_type, return_pct, pnl, new_bankroll, " BUSTED" if busted else "")
+
+    return {
+        "sim_trade_id": sim_trade["id"],
+        "stake": stake,
+        "return_pct": return_pct,
+        "pnl": pnl,
+        "new_bankroll": new_bankroll,
+        "outcome_type": outcome_type,
+        "exit_reason": exit_reason,
+        "busted": busted,
+        "profitable": profitable,
+        "question": sim_trade["question"],
+    }
+
+
+async def get_sim_summary(conn, sim_date=None):
+    """Returns the sim_daily_log row for a given date (default: today)."""
+    date_str = sim_date or now().strftime("%Y-%m-%d")
+    row = await conn.fetchrow(
+        "SELECT * FROM sim_daily_log WHERE sim_date = $1", date_str
+    )
+    return dict(row) if row else None
+
+
+async def get_sim_trades_for_date(conn, sim_date=None):
+    """Returns all sim trades for a given date."""
+    date_str = sim_date or now().strftime("%Y-%m-%d")
+    rows = await conn.fetch(
+        "SELECT * FROM sim_trades WHERE sim_date = $1 ORDER BY opened_at", date_str
+    )
+    return [dict(r) for r in rows]
+
+
+async def run_sim_weekly_report(conn):
+    """
+    Computes a 7-day simulation performance report.
+    Called alongside the weekly backtest every Sunday.
+    """
+    rows = await conn.fetch("""
+        SELECT * FROM sim_daily_log
+        WHERE created_at > NOW() - INTERVAL '7 days'
+        ORDER BY sim_date
+    """)
+    if not rows:
+        return "📊 Sim Report: No data yet for the past 7 days."
+
+    total_pnl     = sum(r["total_pnl"] or 0 for r in rows)
+    total_staked  = sum(r["total_staked"] or 0 for r in rows)
+    total_trades  = sum(r["trades_placed"] or 0 for r in rows)
+    total_wins    = sum(r["trades_won"] or 0 for r in rows)
+    bust_days     = sum(1 for r in rows if r["busted"])
+    win_rate      = round(total_wins / total_trades * 100, 1) if total_trades else 0
+    roi           = round(total_pnl / total_staked * 100, 1) if total_staked else 0
+
+    day_lines = []
+    for r in rows:
+        pnl    = r["total_pnl"] or 0
+        br     = r["ending_bankroll"] or 0
+        busted = " 💀 BUSTED" if r["busted"] else ""
+        sign   = "+" if pnl >= 0 else ""
+        day_lines.append(
+            f"  {r['sim_date']}: {sign}${round(pnl,2)} "
+            f"({r['trades_won']}/{r['trades_placed']} wins) "
+            f"→ ${round(br,2)}{busted}"
+        )
+
+    sign = "+" if total_pnl >= 0 else ""
+    lines = [
+        "🎮 <b>Weekly Sim Report ($200/day)</b>",
+        "",
+        f"<b>7-Day Summary:</b>",
+        f"  Total P&L: {sign}${round(total_pnl, 2)}",
+        f"  Total Staked: ${round(total_staked, 2)}",
+        f"  ROI on staked: {sign}{roi}%",
+        f"  Win Rate: {win_rate}% ({total_wins}/{total_trades})",
+        f"  Bust Days: {bust_days}/7",
+        "",
+        "<b>Daily Breakdown:</b>",
+    ] + day_lines
 
     return "\n".join(lines)
