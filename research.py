@@ -84,16 +84,16 @@ async def get_fear_greed():
                         trend = "IMPROVING" if scores_7d[0] > scores_7d[-1] else "DECLINING"
                         if score <= 25:
                             regime = "Extreme Fear"
-                            sentiment_bonus = 15 if trend == "IMPROVING" else 5
+                            sentiment_bonus = 0
                         elif score <= 49:
                             regime = "Fear"
-                            sentiment_bonus = 5
+                            sentiment_bonus = 0
                         elif score <= 74:
                             regime = "Greed"
-                            sentiment_bonus = -5
+                            sentiment_bonus = 0
                         else:
                             regime = "Extreme Greed"
-                            sentiment_bonus = -15
+                            sentiment_bonus = 0
                         return {
                             "score": score,
                             "classification": classification,

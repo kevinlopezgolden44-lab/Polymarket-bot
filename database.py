@@ -81,7 +81,8 @@ async def backfill_outcome_types(conn):
                     exit_return_pct = $4,
                     peak_price      = $5,
                     peak_return_pct = $6,
-                    exit_reason     = 'RESOLVED'
+                    exit_reason     = 'RESOLVED',
+                    is_backfilled   = TRUE
                 WHERE id = $7
             """, outcome_type, entry, exit_price,
                 exit_return_pct, peak_price, peak_return_pct,
@@ -259,6 +260,7 @@ async def init_db(conn):
         ("exit_return_pct", "FLOAT"),
         ("exit_reason", "TEXT"),
         ("signals_fired", "TEXT"),
+        ("is_backfilled", "BOOLEAN"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -666,11 +668,15 @@ async def run_weekly_backtest(conn):
     wins = sum(1 for r in rows if r["profitable"])
     win_rate = round(wins / total * 100, 1) if total else 0
 
-    returns = [r["exit_return_pct"] for r in rows if r["exit_return_pct"] is not None]
-    avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+    live_rows = [r for r in rows if not r.get("is_backfilled")]
+    returns = [r["exit_return_pct"] for r in live_rows if r["exit_return_pct"] is not None]
+    avg_return = round(sum(returns) / len(returns), 1) if returns else None
 
-    peak_returns = [r["peak_return_pct"] for r in rows if r["peak_return_pct"] is not None]
-    avg_peak = round(sum(peak_returns) / len(peak_returns), 1) if peak_returns else 0
+    peak_returns = [r["peak_return_pct"] for r in live_rows if r["peak_return_pct"] is not None]
+    avg_peak = round(sum(peak_returns) / len(peak_returns), 1) if peak_returns else None
+
+    avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
+    avg_peak_str = ("+" + str(avg_peak) + "%") if avg_peak is not None else "tracking soon"
 
     # Win rate by category
     by_category = {}
@@ -735,8 +741,8 @@ async def run_weekly_backtest(conn):
         "",
         f"<b>Overall ({total} closed trades)</b>",
         f"Win Rate: {win_rate}%",
-        f"Avg Exit Return: {avg_return:+}%",
-        f"Avg Peak Return: {avg_peak:+}%",
+        f"Avg Exit Return: {avg_return_str}",
+        f"Avg Peak Return: {avg_peak_str}",
         "",
         "<b>By Category:</b>",
     ] + cat_lines + [

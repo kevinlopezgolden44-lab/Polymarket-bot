@@ -137,13 +137,15 @@ async def send_status(token, chat_id, conn):
         profitable_count = sum(1 for a in resolved if a["profitable"])
         win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
 
-        # Avg exit return
-        returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
-        avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+        # Only include live-tracked trades (not backfilled estimates) for return stats
+        live_resolved = [a for a in resolved if not a.get("is_backfilled")]
+        returns = [a["exit_return_pct"] for a in live_resolved if a.get("exit_return_pct") is not None]
+        avg_return = round(sum(returns) / len(returns), 1) if returns else None
+        peaks = [a["peak_return_pct"] for a in live_resolved if a.get("peak_return_pct") is not None]
+        avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else None
 
-        # Avg peak return (best possible exit)
-        peaks = [a["peak_return_pct"] for a in resolved if a.get("peak_return_pct") is not None]
-        avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else 0
+        avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
+        avg_peak_str = ("+" + str(avg_peak) + "%") if avg_peak is not None else "tracking soon"
 
         # Outcome type breakdown
         outcome_counts = {}
@@ -191,9 +193,10 @@ async def send_status(token, chat_id, conn):
             + now().strftime("%B %d, %Y %H:%M UTC") + "\n\n"
             + "<b>Performance:</b>\n"
             + "Win Rate: " + str(win_rate) + "% (" + str(len(resolved)) + " resolved)\n"
-            + "Avg Exit Return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n"
-            + "Avg Peak Return: +" + str(avg_peak) + "%\n"
-            + "Open Positions: " + str(open_positions) + "\n\n"
+            + "Avg Exit Return: " + avg_return_str + "\n"
+            + "Avg Peak Return: " + avg_peak_str + "\n"
+            + "Open Positions: " + str(open_positions) + "\n"
+            + "Live Tracked: " + str(len(live_resolved)) + " / " + str(len(resolved)) + " resolved\n\n"
             + "<b>Outcome Breakdown:</b>\n"
             + outcome_lines
             + "\n<b>Win Rate by Category:</b>\n"
@@ -247,8 +250,10 @@ async def send_daily_summary(token, chat_id, conn):
     profitable_count = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
 
-    returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
-    avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+    live_resolved = [a for a in resolved if not a.get("is_backfilled")]
+    returns = [a["exit_return_pct"] for a in live_resolved if a.get("exit_return_pct") is not None]
+    avg_return = round(sum(returns) / len(returns), 1) if returns else None
+    avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
 
     # Positions closed today
     closed_today = await conn.fetch("""
@@ -314,7 +319,7 @@ async def send_daily_summary(token, chat_id, conn):
         + "<b>All-Time Performance:</b>\n"
         + "  Total resolved: " + str(len(resolved)) + "\n"
         + "  Win rate: " + str(win_rate) + "%\n"
-        + "  Avg exit return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n\n"
+        + "  Avg exit return: " + avg_return_str + "\n\n"
         + "<b>Dynamic Risk:</b>\n"
         + "  Max trade: $" + str(limits["max_trade_size"]) + "\n"
         + "  Win streak: " + str(state["win_streak"]) + "\n"
@@ -387,10 +392,13 @@ async def send_weekly_analysis(token, chat_id, conn):
     open_positions = await conn.fetchval(
         "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
     )
-    returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
-    avg_return = round(sum(returns) / len(returns), 1) if returns else 0
-    peaks = [a["peak_return_pct"] for a in resolved if a.get("peak_return_pct") is not None]
-    avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else 0
+    live_resolved = [a for a in resolved if not a.get("is_backfilled")]
+    returns = [a["exit_return_pct"] for a in live_resolved if a.get("exit_return_pct") is not None]
+    avg_return = round(sum(returns) / len(returns), 1) if returns else None
+    peaks = [a["peak_return_pct"] for a in live_resolved if a.get("peak_return_pct") is not None]
+    avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else None
+    avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
+    avg_peak_str = ("+" + str(avg_peak) + "%") if avg_peak is not None else "tracking soon"
 
     agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL")
     disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL")
@@ -405,8 +413,8 @@ async def send_weekly_analysis(token, chat_id, conn):
         + "  Opportunities logged: " + str(total_opps) + "\n"
         + "  Resolved: " + str(len(resolved)) + "\n"
         + "  Win rate: " + str(win_rate) + "%\n"
-        + "  Avg exit return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n"
-        + "  Avg peak return: +" + str(avg_peak) + "%\n"
+        + "  Avg exit return: " + avg_return_str + "\n"
+        + "  Avg peak return: " + avg_peak_str + "\n"
         + "  Open positions: " + str(open_positions) + "\n\n"
         + "<b>Your Judgment Accuracy:</b>\n"
         + "  When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
