@@ -66,20 +66,27 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
         "Economics": "📈", "Science": "🔬", "General": "📊"
     }.get(opp.get("category", "General"), "📊")
 
+    entry = opp["yes_price"]
+    take_profit_price = round(min(entry * 1.40, 0.99), 2)
+    stop_loss_price   = round(max(entry * 0.75, 0.01), 2)
+
     msg = (
         confidence_emoji + " <b>Opportunity Found!</b> " + category_emoji + "\n\n"
         "<b>Market:</b> " + opp["question"][:100] + "\n"
         "<b>Category:</b> " + opp.get("category", "General") + "\n"
-        "<b>YES Price:</b> " + str(round(opp["yes_price"] * 100)) + "%\n"
+        "<b>YES Price:</b> " + str(round(entry * 100)) + "¢\n"
         "<b>Score:</b> " + str(opp["score"]) + "/100\n"
-        "<b>Confidence:</b> " + opp.get("confidence_tier", "Medium") + "\n"
+        "<b>Confidence:</b> " + opp.get("confidence_tier", "MEDIUM") + "\n"
         "<b>Why:</b> " + opp["reason"] + "\n"
-        "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n"
-        "<b>Max Trade Size:</b> $" + str(limits["max_trade_size"]) + "\n"
+        "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n\n"
+        "<b>Position Management:</b>\n"
+        "  Take Profit: " + str(round(take_profit_price * 100)) + "¢ (+40%)\n"
+        "  Stop Loss:   " + str(round(stop_loss_price * 100)) + "¢ (-25%)\n"
+        "  Max Trade:   $" + str(limits["max_trade_size"]) + "\n"
     )
 
     if opp.get("age") and opp["age"] < 24:
-        msg += "<b>🆕 New Market:</b> Only " + str(round(opp["age"])) + "h old\n"
+        msg += "\n🆕 <b>New Market:</b> Only " + str(round(opp["age"])) + "h old\n"
 
     if opp.get("velocity_alert"):
         msg += "\n⚡ " + opp["velocity_alert"] + "\n"
@@ -101,6 +108,10 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
     if opp.get("liquidity_warning"):
         msg += "\n⚠️ " + opp["liquidity_warning"] + "\n"
 
+    if opp.get("signals_fired"):
+        sig_display = opp["signals_fired"].replace(",", " · ")
+        msg += "\n🔍 <b>Signals:</b> " + sig_display + "\n"
+
     if research:
         msg += "\n" + research + "\n"
 
@@ -120,8 +131,29 @@ async def send_status(token, chat_id, conn):
         resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
         total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
         total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+        open_positions = await conn.fetchval(
+            "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
+        )
         profitable_count = sum(1 for a in resolved if a["profitable"])
         win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
+
+        # Avg exit return
+        returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
+        avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+
+        # Avg peak return (best possible exit)
+        peaks = [a["peak_return_pct"] for a in resolved if a.get("peak_return_pct") is not None]
+        avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else 0
+
+        # Outcome type breakdown
+        outcome_counts = {}
+        for a in resolved:
+            ot = a.get("outcome_type") or "UNKNOWN"
+            outcome_counts[ot] = outcome_counts.get(ot, 0) + 1
+
+        outcome_lines = ""
+        for ot, count in sorted(outcome_counts.items(), key=lambda x: -x[1]):
+            outcome_lines += "  " + ot + ": " + str(count) + "\n"
 
         cat_stats = {}
         for cat in ["Crypto", "Sports", "Politics", "Economics", "Science"]:
@@ -157,36 +189,42 @@ async def send_status(token, chat_id, conn):
         msg = (
             "<b>Bot Status Report</b>\n"
             + now().strftime("%B %d, %Y %H:%M UTC") + "\n\n"
-            + "<b>Win Rates:</b>\n"
-            + "Overall: " + str(win_rate) + "% (" + str(len(resolved)) + " resolved)\n"
+            + "<b>Performance:</b>\n"
+            + "Win Rate: " + str(win_rate) + "% (" + str(len(resolved)) + " resolved)\n"
+            + "Avg Exit Return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n"
+            + "Avg Peak Return: +" + str(avg_peak) + "%\n"
+            + "Open Positions: " + str(open_positions) + "\n\n"
+            + "<b>Outcome Breakdown:</b>\n"
+            + outcome_lines
+            + "\n<b>Win Rate by Category:</b>\n"
         )
         for cat, stat in cat_stats.items():
-            msg += cat + ": " + stat + "\n"
+            msg += "  " + cat + ": " + stat + "\n"
 
         msg += (
             "\n<b>Confidence Tiers:</b>\n"
-            + "High confidence: " + str(high_win) + "% (" + str(len(high_conf)) + " resolved)\n\n"
+            + "  HIGH: " + str(high_win) + "% (" + str(len(high_conf)) + " resolved)\n\n"
             + "<b>Sentiment Win Rates:</b>\n"
-            + "During Fear: " + str(fear_win) + "% (" + str(len(fear_res)) + ")\n"
-            + "During Greed: " + str(greed_win) + "% (" + str(len(greed_res)) + ")\n\n"
+            + "  During Fear: " + str(fear_win) + "% (" + str(len(fear_res)) + ")\n"
+            + "  During Greed: " + str(greed_win) + "% (" + str(len(greed_res)) + ")\n\n"
             + "<b>Your Judgment:</b>\n"
-            + "When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
-            + "When disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
+            + "  When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
+            + "  When disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
             + "<b>Risk Limits:</b>\n"
-            + "Max trade size: $" + str(limits["max_trade_size"]) + "\n"
-            + "Max daily loss: $" + str(limits["max_daily_loss"]) + "\n"
-            + "Win streak: " + str(state["win_streak"]) + "\n"
-            + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
+            + "  Max trade: $" + str(limits["max_trade_size"]) + "\n"
+            + "  Max daily loss: $" + str(limits["max_daily_loss"]) + "\n"
+            + "  Win streak: " + str(state["win_streak"]) + "\n"
+            + "  Loss streak: " + str(state["loss_streak"]) + "\n\n"
             + "<b>Database:</b>\n"
-            + "Total alerts: " + str(total_alerts) + "\n"
-            + "Opportunities logged: " + str(total_opps) + "\n"
-            + "Resolved: " + str(len(resolved)) + "\n"
+            + "  Total alerts: " + str(total_alerts) + "\n"
+            + "  Opportunities logged: " + str(total_opps) + "\n"
+            + "  Resolved: " + str(len(resolved)) + "\n"
         )
 
         if sentiment:
             msg += (
                 "\n<b>Current Sentiment:</b>\n"
-                + "Fear and Greed: " + str(sentiment["score"])
+                + "  Fear and Greed: " + str(sentiment["score"])
                 + " (" + str(sentiment["regime"]) + ") "
                 + str(sentiment["trend"]) + "\n"
             )
@@ -198,13 +236,30 @@ async def send_status(token, chat_id, conn):
         await send_message(token, chat_id, "Error generating status: " + str(e)[:200])
 
 async def send_daily_summary(token, chat_id, conn):
-    from database import get_risk_state, get_dynamic_limits, get_daily_stats
+    from database import get_risk_state, get_dynamic_limits, get_daily_stats, get_sim_summary, get_sim_trades_for_date
     alerts_today = await get_daily_stats(conn)
     total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+    open_positions = await conn.fetchval(
+        "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
+    )
     resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
     profitable_count = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
+
+    returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
+    avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+
+    # Positions closed today
+    closed_today = await conn.fetch("""
+        SELECT * FROM trade_positions
+        WHERE is_open = FALSE
+        AND closed_at > NOW() - INTERVAL '24 hours'
+    """)
+    closed_today_wins = sum(1 for p in closed_today if p.get("outcome_type") in ("FULL_WIN", "PARTIAL_WIN"))
+    closed_today_returns = [p["return_pct"] for p in closed_today if p.get("return_pct") is not None]
+    avg_today_return = round(sum(closed_today_returns) / len(closed_today_returns), 1) if closed_today_returns else 0
+
     avg_score = sum(a["score"] for a in alerts_today) / len(alerts_today) if alerts_today else 0
     agreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='agree'") or 0
     disagreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='disagree'") or 0
@@ -227,38 +282,72 @@ async def send_daily_summary(token, chat_id, conn):
     msg = (
         "<b>Daily Summary Report</b>\n"
         + now().strftime("%B %d, %Y") + "\n\n"
-        + "Alerts today: " + str(len(alerts_today)) + "\n"
-        + "Avg score: " + str(round(avg_score)) + "/100\n\n"
-        + "By Category:\n"
+        + "<b>Today's Activity:</b>\n"
+        + "  Alerts sent: " + str(len(alerts_today)) + "\n"
+        + "  Avg score: " + str(round(avg_score)) + "/100\n"
+        + "  Open positions: " + str(open_positions) + "\n"
     )
+
+    if closed_today:
+        msg += (
+            "\n<b>Positions Closed Today:</b>\n"
+            + "  Closed: " + str(len(closed_today)) + "\n"
+            + "  Wins: " + str(closed_today_wins) + " / " + str(len(closed_today)) + "\n"
+            + "  Avg return: " + ("+" if avg_today_return >= 0 else "") + str(avg_today_return) + "%\n"
+        )
+
+    msg += "\n<b>By Category:</b>\n"
     for cat, count in cat_counts.items():
-        msg += cat + ": " + str(count) + "\n"
+        msg += "  " + cat + ": " + str(count) + "\n"
 
     if sentiment_today:
         msg += (
-            "\nMarket Sentiment:\n"
-            + "Fear and Greed: " + str(sentiment_today["score"])
+            "\n<b>Market Sentiment:</b>\n"
+            + "  Fear and Greed: " + str(sentiment_today["score"])
             + " (" + str(sentiment_today["regime"]) + ")\n"
         )
 
     msg += (
-        "\nYour Ratings:\n"
-        + "Agreed: " + str(agreed) + "\n"
-        + "Disagreed: " + str(disagreed) + "\n\n"
-        + "Resolved Markets:\n"
-        + "Total resolved: " + str(len(resolved)) + "\n"
-        + "Profitable: " + str(profitable_count) + "\n"
-        + "Win rate: " + str(win_rate) + "%\n\n"
-        + "Dynamic Risk:\n"
-        + "Max trade: $" + str(limits["max_trade_size"]) + "\n"
-        + "Win streak: " + str(state["win_streak"]) + "\n"
-        + "Loss streak: " + str(state["loss_streak"]) + "\n\n"
-        + "Database:\n"
-        + "Total alerts: " + str(total_count) + "\n"
-        + "Opportunities: " + str(total_opps) + "\n\n"
+        "\n<b>Your Ratings:</b>\n"
+        + "  Agreed: " + str(agreed) + "\n"
+        + "  Disagreed: " + str(disagreed) + "\n\n"
+        + "<b>All-Time Performance:</b>\n"
+        + "  Total resolved: " + str(len(resolved)) + "\n"
+        + "  Win rate: " + str(win_rate) + "%\n"
+        + "  Avg exit return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n\n"
+        + "<b>Dynamic Risk:</b>\n"
+        + "  Max trade: $" + str(limits["max_trade_size"]) + "\n"
+        + "  Win streak: " + str(state["win_streak"]) + "\n"
+        + "  Loss streak: " + str(state["loss_streak"]) + "\n\n"
+        + "<b>Database:</b>\n"
+        + "  Total alerts: " + str(total_count) + "\n"
+        + "  Opportunities: " + str(total_opps) + "\n\n"
         + "Type /status for live stats!"
     )
     await send_message(token, chat_id, msg)
+
+    # Sim daily summary as a separate message
+    sim = await get_sim_summary(conn)
+    if sim:
+        pnl   = sim["total_pnl"] or 0
+        br    = sim["ending_bankroll"] or 0
+        staked = sim["total_staked"] or 0
+        sign  = "+" if pnl >= 0 else ""
+        roi   = round(pnl / staked * 100, 1) if staked else 0
+        bust  = "\n💀 <b>Busted today</b> — monitoring continued" if sim["busted"] else ""
+        win_rate = round(sim["trades_won"] / sim["trades_placed"] * 100) if sim["trades_placed"] else 0
+        sim_msg = (
+            f"🎮 <b>Daily Sim Summary ($200 budget)</b>\n\n"
+            f"Trades: {sim['trades_placed']}  |  "
+            f"Wins: {sim['trades_won']}  |  "
+            f"Win Rate: {win_rate}%\n"
+            f"Total Staked: ${round(staked, 2)}\n"
+            f"P&L: {sign}${round(pnl, 2)}  ({sign}{roi}% ROI)\n"
+            f"Closing Bankroll: ${round(br, 2)} / $200"
+            f"{bust}"
+        )
+        await send_message(token, chat_id, sim_msg)
+
     log.info("Daily summary sent")
 
 async def send_heartbeat(token, chat_id, conn):
@@ -284,25 +373,24 @@ async def send_heartbeat(token, chat_id, conn):
     log.info("Heartbeat sent")
 
 async def send_weekly_analysis(token, chat_id, conn):
+    """
+    Sends a lightweight weekly operational summary.
+    The deep signal/category backtest is handled separately
+    by run_weekly_backtest() in database.py and sent right after this.
+    """
     total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
     resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
     profitable = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable / len(resolved) * 100) if resolved else 0
 
-    cat_lines = []
-    for cat in ["Crypto", "Sports", "Politics", "Economics", "Science"]:
-        cat_res = [a for a in resolved if
-                  a.get("category") == cat or
-                  (a.get("reason") and cat + " market" in a["reason"])]
-        if cat_res:
-            cat_win = round(sum(1 for a in cat_res if a["profitable"]) / len(cat_res) * 100)
-            cat_lines.append(cat + ": " + str(cat_win) + "% (" + str(len(cat_res)) + " resolved)")
-
-    fear_res = [a for a in resolved if a.get("fear_greed_regime") in ["Extreme Fear", "Fear"]]
-    greed_res = [a for a in resolved if a.get("fear_greed_regime") in ["Greed", "Extreme Greed"]]
-    fear_win = round(sum(1 for a in fear_res if a["profitable"]) / len(fear_res) * 100) if fear_res else 0
-    greed_win = round(sum(1 for a in greed_res if a["profitable"]) / len(greed_res) * 100) if greed_res else 0
+    open_positions = await conn.fetchval(
+        "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
+    )
+    returns = [a["exit_return_pct"] for a in resolved if a.get("exit_return_pct") is not None]
+    avg_return = round(sum(returns) / len(returns), 1) if returns else 0
+    peaks = [a["peak_return_pct"] for a in resolved if a.get("peak_return_pct") is not None]
+    avg_peak = round(sum(peaks) / len(peaks), 1) if peaks else 0
 
     agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL")
     disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL")
@@ -310,20 +398,20 @@ async def send_weekly_analysis(token, chat_id, conn):
     disagreed_win = round(sum(1 for a in disagreed if a["profitable"]) / len(disagreed) * 100) if disagreed else 0
 
     msg = (
-        "<b>Weekly Self-Analysis Report</b>\n"
+        "<b>Weekly Summary</b>\n"
         + now().strftime("%B %d, %Y") + "\n\n"
-        + "Total alerts: " + str(total_alerts) + "\n"
-        + "Opportunities logged: " + str(total_opps) + "\n"
-        + "Resolved: " + str(len(resolved)) + "\n"
-        + "Win rate: " + str(win_rate) + "%\n\n"
-        + "By Category:\n"
-        + "\n".join(cat_lines if cat_lines else ["No resolved data yet"]) + "\n\n"
-        + "By Sentiment:\n"
-        + "During Fear: " + str(fear_win) + "% (" + str(len(fear_res)) + ")\n"
-        + "During Greed: " + str(greed_win) + "% (" + str(len(greed_res)) + ")\n\n"
-        + "Your Judgment:\n"
-        + "When agreed: " + str(agreed_win) + "%\n"
-        + "When disagreed: " + str(disagreed_win) + "%\n\n"
+        + "<b>All-Time Stats:</b>\n"
+        + "  Total alerts: " + str(total_alerts) + "\n"
+        + "  Opportunities logged: " + str(total_opps) + "\n"
+        + "  Resolved: " + str(len(resolved)) + "\n"
+        + "  Win rate: " + str(win_rate) + "%\n"
+        + "  Avg exit return: " + ("+" if avg_return >= 0 else "") + str(avg_return) + "%\n"
+        + "  Avg peak return: +" + str(avg_peak) + "%\n"
+        + "  Open positions: " + str(open_positions) + "\n\n"
+        + "<b>Your Judgment Accuracy:</b>\n"
+        + "  When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
+        + "  When disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
+        + "Full signal breakdown follows below ↓\n"
         + "Type /status anytime for live stats!"
     )
     await send_message(token, chat_id, msg)
