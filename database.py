@@ -962,3 +962,87 @@ async def run_weekly_backtest(conn):
     ] + outcome_lines
 
     return "\n".join(lines)
+
+
+# ── RICH DATA COLLECTION FUNCTIONS ────────────────────────────────────────────
+
+async def record_alert_snapshot(conn, alert_id, market_id, yes_price,
+                                  alerted_at, bid_price=None, ask_price=None):
+    """
+    Records a price snapshot for an alerted market every 15 minutes
+    for 48 hours after the alert fired.
+    """
+    last = await conn.fetchrow("""
+        SELECT recorded_at FROM alert_price_snapshots
+        WHERE alert_id = $1 ORDER BY recorded_at DESC LIMIT 1
+    """, alert_id)
+
+    if last:
+        mins_since = (now() - last["recorded_at"]).total_seconds() / 60
+        if mins_since < 14:
+            return
+
+    hours_since_alert = (now() - alerted_at).total_seconds() / 3600
+    if hours_since_alert > 48:
+        return
+
+    minutes_since = int((now() - alerted_at).total_seconds() / 60)
+
+    await conn.execute("""
+        INSERT INTO alert_price_snapshots
+            (alert_id, market_id, yes_price, bid_price, ask_price,
+             recorded_at, minutes_since_alert)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+    """, alert_id, market_id, yes_price, bid_price, ask_price, now(), minutes_since)
+
+
+async def update_position_timing(conn, alert_id, current_price, entry_price):
+    """
+    Tracks peak_reached_at, first_profitable_at, last_profitable_at.
+    """
+    alert = await conn.fetchrow("""
+        SELECT peak_price, peak_reached_at, first_profitable_at, entry_price
+        FROM alerts WHERE id = $1
+    """, alert_id)
+
+    if not alert:
+        return
+
+    updates = {}
+    current_peak = alert["peak_price"] or entry_price
+
+    if current_price > current_peak:
+        updates["peak_reached_at"] = now()
+
+    if current_price > entry_price:
+        if not alert["first_profitable_at"]:
+            updates["first_profitable_at"] = now()
+        updates["last_profitable_at"] = now()
+
+    if updates:
+        set_clauses = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(updates))
+        values = list(updates.values())
+        await conn.execute(
+            f"UPDATE alerts SET {set_clauses} WHERE id = $1",
+            alert_id, *values
+        )
+
+
+async def get_alert_price_curve(conn, alert_id):
+    """Returns the full post-alert price curve for a given alert."""
+    rows = await conn.fetch("""
+        SELECT yes_price, bid_price, ask_price, recorded_at, minutes_since_alert
+        FROM alert_price_snapshots
+        WHERE alert_id = $1
+        ORDER BY recorded_at ASC
+    """, alert_id)
+    return [dict(r) for r in rows]
+
+
+async def cleanup_old_snapshots(conn):
+    """Removes snapshots older than 30 days. Called weekly."""
+    await conn.execute("""
+        DELETE FROM alert_price_snapshots
+        WHERE recorded_at < NOW() - INTERVAL '30 days'
+    """)
+    log.info("Cleaned up old price snapshots")
