@@ -14,7 +14,7 @@ from database import (
     update_open_positions, run_weekly_backtest,
     record_alert_snapshot, cleanup_old_snapshots
 )
-from scoring import score_opportunity, is_market_active, detect_category
+from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
 from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -404,6 +404,27 @@ async def main():
                         "final_score": score,
                     }
 
+                    # Market type (sub-category for strategy analysis)
+                    market_type = result.get("market_type", "GENERAL")
+
+                    # Price position in 30-day range (where is entry vs historical range)
+                    price_pct_of_range = None
+                    history_30d = await conn.fetch("""
+                        SELECT yes_price FROM price_history
+                        WHERE market_id=$1
+                        AND recorded_at > NOW() - INTERVAL '30 days'
+                    """, market_id)
+                    if history_30d and len(history_30d) >= 3:
+                        prices_30d = [float(r["yes_price"]) for r in history_30d]
+                        lo, hi = min(prices_30d), max(prices_30d)
+                        if hi > lo:
+                            price_pct_of_range = round((yes_price - lo) / (hi - lo) * 100, 1)
+
+                    # Revisit count — how many times has this market been seen before
+                    revisit_count = await conn.fetchval(
+                        "SELECT COUNT(*) FROM alerts WHERE market_id=$1", market_id
+                    )
+
                     opp = {
                         "id": market_id,
                         "question": question,
@@ -418,6 +439,8 @@ async def main():
                         "bid_price": bid_price,
                         "ask_price": ask_price,
                         "score_breakdown": score_breakdown,
+                        "market_type": market_type,
+                        "price_pct_of_range": price_pct_of_range,
                     }
 
                     # Run analysis modules
@@ -538,6 +561,15 @@ async def main():
                                 conn, opp, fear_greed, opp.get("age")
                             )
                             alerted_markets.add(opp["id"])
+                        else:
+                            # Market seen again — increment revisit counter
+                            await conn.execute("""
+                                UPDATE alerts SET revisit_count = COALESCE(revisit_count, 0) + 1
+                                WHERE market_id=$1 AND id=(
+                                    SELECT id FROM alerts WHERE market_id=$1
+                                    ORDER BY alerted_at DESC LIMIT 1
+                                )
+                            """, opp["id"])
 
                             research = await build_research_summary(
                                 opp["question"], opp["yes_price"],

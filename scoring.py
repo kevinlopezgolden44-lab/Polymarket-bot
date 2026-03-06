@@ -366,6 +366,46 @@ def is_market_active(market):
         return True
 
 
+
+# ── 9b. MARKET TYPE DETECTION ──────────────────────────────────────────────────
+def detect_market_type(question):
+    """
+    Within a category, identifies the specific type of market.
+    Most useful for Crypto where market types behave very differently.
+
+    Returns one of:
+      PRICE_TARGET    — "Will BTC reach $100k?"
+      PERCENTAGE_MOVE — "Will BTC gain 20% this month?"
+      DOMINANCE       — "Will BTC dominance exceed 60%?"
+      EVENT           — "Will BTC ETF be approved?"
+      RANGE           — "Will BTC stay above $80k?"
+      COMPARISON      — "Will ETH outperform BTC?"
+      GENERAL         — anything else
+    """
+    q = question.lower()
+
+    if any(w in q for w in ["reach", "hit", "exceed", "above", "below", "dip", "drop to", "fall to"]):
+        if "$" in q or any(c.isdigit() for c in q):
+            return "PRICE_TARGET"
+
+    if any(w in q for w in ["gain", "rise", "increase", "grow", "pump"]) and "%" in q:
+        return "PERCENTAGE_MOVE"
+
+    if "dominance" in q:
+        return "DOMINANCE"
+
+    if any(w in q for w in ["etf", "approve", "approved", "launch", "halving",
+                              "fork", "upgrade", "ban", "regulate", "sec", "lawsuit"]):
+        return "EVENT"
+
+    if any(w in q for w in ["stay above", "remain above", "stay below", "between", "range"]):
+        return "RANGE"
+
+    if any(w in q for w in ["outperform", "beat", "higher than", "more than"]):
+        return "COMPARISON"
+
+    return "GENERAL"
+
 # ── 12. SCORE OPPORTUNITY ─────────────────────────────────────────────────────
 def score_opportunity(market, price_history_rows=None, all_markets=None,
                       crypto_data=None, upcoming_events=None, fear_greed=None):
@@ -475,10 +515,13 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     confidence = calculate_confidence_tier(score, confirming, contradicting)
     reason = " | ".join(flags) if flags else "Score: " + str(score)
 
+    market_type = detect_market_type(question)
+
     return {
         "score": score,
         "reason": reason,
         "category": category,
+        "market_type": market_type,
         "confidence": confidence,
         "flags": flags,
         "signals": {

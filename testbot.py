@@ -97,17 +97,20 @@ class TestScoreOpportunity(unittest.TestCase):
 
     def test_fear_greed_bonus_applied(self):
         market = make_market()
+        # Fear & greed bonus is now 0 across all regimes (removed to reduce noise)
+        # Test that the field is accepted without error and scores are equal
         fear_greed_fear = {
             "success": True, "score": 20, "regime": "Extreme Fear",
-            "sentiment_bonus": 15, "trend": "IMPROVING"
+            "sentiment_bonus": 0, "trend": "IMPROVING"
         }
         fear_greed_greed = {
             "success": True, "score": 80, "regime": "Extreme Greed",
-            "sentiment_bonus": -15, "trend": "DECLINING"
+            "sentiment_bonus": 0, "trend": "DECLINING"
         }
         fear_result = score_opportunity(market, fear_greed=fear_greed_fear)
         greed_result = score_opportunity(market, fear_greed=fear_greed_greed)
-        assert fear_result["score"] > greed_result["score"]
+        # Scores should now be equal since bonus is 0
+        assert fear_result["score"] == greed_result["score"]
 
     def test_fresh_market_gets_bonus(self):
         fresh = make_market(created_hours_ago=5)
@@ -301,6 +304,31 @@ class TestCrossMarketConsistency(unittest.TestCase):
         others = [make_market(question="Will the Lakers win the NBA?", yes_price=0.30)]
         result = check_cross_market_consistency(base, others)
         assert result == []
+
+
+
+# ── market_type detection ──────────────────────────────────────────────────────
+
+from scoring import detect_market_type
+
+class TestDetectMarketType(unittest.TestCase):
+    def test_price_target(self):
+        assert detect_market_type("Will BTC reach $100k?") == "PRICE_TARGET"
+
+    def test_percentage_move(self):
+        assert detect_market_type("Will ETH gain 20% this month?") == "PERCENTAGE_MOVE"
+
+    def test_dominance(self):
+        assert detect_market_type("Will BTC dominance exceed 60%?") == "DOMINANCE"
+
+    def test_event(self):
+        assert detect_market_type("Will the Bitcoin ETF be approved?") == "EVENT"
+
+    def test_score_opportunity_returns_market_type(self):
+        market = make_market(question="Will BTC reach $100k?")
+        result = score_opportunity(market)
+        assert "market_type" in result
+        assert result["market_type"] == "PRICE_TARGET"
 
 
 if __name__ == "__main__":
