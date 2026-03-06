@@ -254,7 +254,6 @@ async def main():
             if (current_time.weekday() == CONFIG["weekly_analysis_day"] and
                     current_time.date() != last_weekly_date):
                 await send_weekly_analysis(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
-                # Run backtest and send results
                 backtest_report = await run_weekly_backtest(conn)
                 await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, backtest_report)
                 last_weekly_date = current_time.date()
@@ -280,8 +279,7 @@ async def main():
             for pos in closed_positions:
                 emoji = "✅" if pos["profitable"] else "❌"
                 direction = "+" if pos["return_pct"] >= 0 else ""
-                await send_message(
-                    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                msg = (
                     f"{emoji} <b>Position Closed [{pos['outcome_type']}]</b>\n\n"
                     f"{pos['question'][:80]}\n\n"
                     f"Entry: {round(pos['entry_price']*100)}¢  →  "
@@ -290,6 +288,7 @@ async def main():
                     f"(Peak was +{pos['peak_return_pct']}%)\n"
                     f"Reason: {pos['exit_reason']}"
                 )
+                await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
 
             # Load upcoming events for this scan
             upcoming_events = await load_upcoming_events(conn)
@@ -482,6 +481,7 @@ async def main():
                                 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
                                 opp, alert_id, research, limits
                             )
+
                 else:
                     log.info("No new alertable opportunities this scan")
 

@@ -239,7 +239,7 @@ async def send_status(token, chat_id, conn):
         await send_message(token, chat_id, "Error generating status: " + str(e)[:200])
 
 async def send_daily_summary(token, chat_id, conn):
-    from database import get_risk_state, get_dynamic_limits, get_daily_stats, get_sim_summary, get_sim_trades_for_date
+    from database import get_risk_state, get_dynamic_limits, get_daily_stats
     alerts_today = await get_daily_stats(conn)
     total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
@@ -330,28 +330,6 @@ async def send_daily_summary(token, chat_id, conn):
         + "Type /status for live stats!"
     )
     await send_message(token, chat_id, msg)
-
-    # Sim daily summary as a separate message
-    sim = await get_sim_summary(conn)
-    if sim:
-        pnl   = sim["total_pnl"] or 0
-        br    = sim["ending_bankroll"] or 0
-        staked = sim["total_staked"] or 0
-        sign  = "+" if pnl >= 0 else ""
-        roi   = round(pnl / staked * 100, 1) if staked else 0
-        bust  = "\n💀 <b>Busted today</b> — monitoring continued" if sim["busted"] else ""
-        win_rate = round(sim["trades_won"] / sim["trades_placed"] * 100) if sim["trades_placed"] else 0
-        sim_msg = (
-            f"🎮 <b>Daily Sim Summary ($200 budget)</b>\n\n"
-            f"Trades: {sim['trades_placed']}  |  "
-            f"Wins: {sim['trades_won']}  |  "
-            f"Win Rate: {win_rate}%\n"
-            f"Total Staked: ${round(staked, 2)}\n"
-            f"P&L: {sign}${round(pnl, 2)}  ({sign}{roi}% ROI)\n"
-            f"Closing Bankroll: ${round(br, 2)} / $200"
-            f"{bust}"
-        )
-        await send_message(token, chat_id, sim_msg)
 
     log.info("Daily summary sent")
 
