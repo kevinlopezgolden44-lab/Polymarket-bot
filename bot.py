@@ -350,8 +350,19 @@ async def main():
                     if any(kw in question_lower for kw in tennis_keywords):
                         continue
 
+                    # Fetch price history before scoring so momentum/velocity signals
+                    # can influence the score even on first evaluation
+                    _market_id_pre = str(market.get("id", ""))
+                    _history_pre = []
+                    if _market_id_pre:
+                        try:
+                            _history_pre = await get_price_history(conn, _market_id_pre)
+                        except Exception:
+                            pass
+
                     result = score_opportunity(
                         market,
+                        price_history_rows=_history_pre,
                         all_markets=active_markets,
                         upcoming_events=upcoming_events,
                         fear_greed=fear_greed
@@ -434,7 +445,7 @@ async def main():
                         "volume": volume,
                         "age": market_age,
                         "category": category,
-                        "confidence_tier": "MEDIUM",
+                        "confidence_tier": "LOW",  # placeholder; overwritten by calculate_confidence_tier below
                         "days_to_resolution": days_to_resolution,
                         "bid_price": bid_price,
                         "ask_price": ask_price,
@@ -557,19 +568,11 @@ async def main():
                         log.info("Score:%d [%s] %s",
                                  opp["score"], opp["category"], opp["question"][:60])
                         if opp["id"] not in alerted_markets:
+                            # First time seeing this market — log it and send alert
                             alert_id = await log_alert(
                                 conn, opp, fear_greed, opp.get("age")
                             )
                             alerted_markets.add(opp["id"])
-                        else:
-                            # Market seen again — increment revisit counter
-                            await conn.execute("""
-                                UPDATE alerts SET revisit_count = COALESCE(revisit_count, 0) + 1
-                                WHERE market_id=$1 AND id=(
-                                    SELECT id FROM alerts WHERE market_id=$1
-                                    ORDER BY alerted_at DESC LIMIT 1
-                                )
-                            """, opp["id"])
 
                             research = await build_research_summary(
                                 opp["question"], opp["yes_price"],
@@ -580,6 +583,15 @@ async def main():
                                 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
                                 opp, alert_id, research, limits
                             )
+                        else:
+                            # Market seen again — increment revisit counter only, no re-alert
+                            await conn.execute("""
+                                UPDATE alerts SET revisit_count = COALESCE(revisit_count, 0) + 1
+                                WHERE market_id=$1 AND id=(
+                                    SELECT id FROM alerts WHERE market_id=$1
+                                    ORDER BY alerted_at DESC LIMIT 1
+                                )
+                            """, opp["id"])
 
                 else:
                     log.info("No new alertable opportunities this scan")
