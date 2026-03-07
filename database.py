@@ -32,69 +32,66 @@ async def backfill_outcome_types(conn):
         AND outcome_type IS NULL
     """)
 
-    if not rows:
+    if rows:
+        log.info("Backfilling %d resolved alerts with outcome_type + return data...", len(rows))
+        updated = 0
+
+        for row in rows:
+            try:
+                entry = float(row["yes_price"])
+                outcome = row["outcome"]          # "YES", "NO", or "PARTIAL"
+                profitable = row["profitable"]
+
+                # Derive exit price from outcome
+                if outcome == "YES":
+                    exit_price = 0.99
+                elif outcome == "NO":
+                    exit_price = 0.01
+                else:
+                    exit_price = entry
+
+                # Derive outcome_type
+                if outcome == "YES":
+                    outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
+                elif outcome == "NO":
+                    outcome_type = "FULL_WIN" if entry > 0.5 else "LOSS"
+                else:
+                    outcome_type = "PARTIAL_WIN" if profitable else "LOSS"
+
+                # Calculate returns
+                if entry and entry > 0:
+                    exit_return_pct = round((exit_price - entry) / entry * 100, 2)
+                else:
+                    exit_return_pct = 0.0
+
+                peak_price = exit_price if outcome_type in ("FULL_WIN", "PARTIAL_WIN") else entry
+                peak_return_pct = round((peak_price - entry) / entry * 100, 2) if entry else 0.0
+
+                await conn.execute("""
+                    UPDATE alerts
+                    SET outcome_type    = $1,
+                        entry_price     = $2,
+                        exit_price      = $3,
+                        exit_return_pct = $4,
+                        peak_price      = $5,
+                        peak_return_pct = $6,
+                        exit_reason     = 'RESOLVED',
+                        is_backfilled   = TRUE
+                    WHERE id = $7
+                """, outcome_type, entry, exit_price,
+                    exit_return_pct, peak_price, peak_return_pct,
+                    row["id"])
+                updated += 1
+
+            except Exception as e:
+                log.warning("Backfill error on alert id=%s: %s", row["id"], e)
+
+        log.info("Backfill complete: %d alerts updated", updated)
+    else:
         log.info("Backfill: nothing to migrate")
-        return
 
-    log.info("Backfilling %d resolved alerts with outcome_type + return data...", len(rows))
-    updated = 0
-
-    for row in rows:
-        try:
-            entry = float(row["yes_price"])
-            outcome = row["outcome"]          # "YES", "NO", or "PARTIAL"
-            profitable = row["profitable"]
-
-            # Derive exit price from outcome
-            if outcome == "YES":
-                exit_price = 0.99
-            elif outcome == "NO":
-                exit_price = 0.01
-            else:
-                # PARTIAL — we don't know exact exit, use entry as neutral fallback
-                exit_price = entry
-
-            # Derive outcome_type
-            if outcome == "YES":
-                outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
-            elif outcome == "NO":
-                outcome_type = "FULL_WIN" if entry > 0.5 else "LOSS"
-            else:
-                outcome_type = "PARTIAL_WIN" if profitable else "LOSS"
-
-            # Calculate returns
-            if entry and entry > 0:
-                exit_return_pct = round((exit_price - entry) / entry * 100, 2)
-            else:
-                exit_return_pct = 0.0
-
-            # Peak: if it was a win, peak = exit. If loss, peak = entry (we never saw higher).
-            # This is conservative but honest — real peaks need price history.
-            peak_price = exit_price if outcome_type in ("FULL_WIN", "PARTIAL_WIN") else entry
-            peak_return_pct = round((peak_price - entry) / entry * 100, 2) if entry else 0.0
-
-            await conn.execute("""
-                UPDATE alerts
-                SET outcome_type    = $1,
-                    entry_price     = $2,
-                    exit_price      = $3,
-                    exit_return_pct = $4,
-                    peak_price      = $5,
-                    peak_return_pct = $6,
-                    exit_reason     = 'RESOLVED',
-                    is_backfilled   = TRUE
-                WHERE id = $7
-            """, outcome_type, entry, exit_price,
-                exit_return_pct, peak_price, peak_return_pct,
-                row["id"])
-            updated += 1
-
-        except Exception as e:
-            log.warning("Backfill error on alert id=%s: %s", row["id"], e)
-
-    log.info("Backfill complete: %d alerts updated", updated)
-
-    # Second pass: mark all pre-upgrade alerts as backfilled using date cutoff
+    # Second pass always runs — marks all pre-upgrade alerts as backfilled.
+    # Runs regardless of whether the first pass found anything to migrate.
     UPGRADE_DATE = "2026-03-06"
     await conn.execute(f"""
         UPDATE alerts
