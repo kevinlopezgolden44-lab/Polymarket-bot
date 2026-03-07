@@ -150,7 +150,12 @@ async def init_db(conn):
             hold_duration_hours FLOAT,
             hour_of_day_utc INTEGER,
             loss_pattern TEXT,
-            revisit_count INTEGER DEFAULT 0
+            revisit_count INTEGER DEFAULT 0,
+            -- Diagnostic columns
+            resolution_price FLOAT,
+            loss_reason TEXT,
+            volume_at_resolution FLOAT,
+            actual_hold_days FLOAT
         )
     """)
 
@@ -321,6 +326,10 @@ async def init_db(conn):
         ("hour_of_day_utc", "INTEGER"),
         ("loss_pattern", "TEXT"),
         ("revisit_count", "INTEGER"),
+        ("resolution_price", "FLOAT"),
+        ("loss_reason", "TEXT"),
+        ("volume_at_resolution", "FLOAT"),
+        ("actual_hold_days", "FLOAT"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -617,10 +626,12 @@ async def update_open_positions(conn):
                             WHERE id=$6
                         """, now(), exit_reason, current_price, return_pct, outcome_type, pos["id"])
 
-                        # Derive hold duration and loss pattern
-                        hold_hours = round(
-                            (now() - pos["opened_at"]).total_seconds() / 3600, 1
-                        )
+                        # Derive hold duration
+                        hold_secs = (now() - pos["opened_at"]).total_seconds()
+                        hold_hours = round(hold_secs / 3600, 1)
+                        actual_hold_days = round(hold_secs / 86400, 2)
+
+                        # Derive loss pattern
                         loss_pattern = None
                         if not profitable:
                             if exit_reason == "STOP_LOSS" and pos["peak_price"] > entry:
@@ -630,16 +641,29 @@ async def update_open_positions(conn):
                             elif exit_reason == "RESOLVED":
                                 loss_pattern = "NEVER_MOVED"
 
+                        # Derive loss reason
+                        loss_reason = None
+                        if not profitable:
+                            loss_reason = derive_loss_reason(
+                                entry, current_price,
+                                float(pos.get("alert_entry") or entry),
+                                peak_price=pos["peak_price"]
+                            )
+
                         await conn.execute("""
                             UPDATE alerts
                             SET outcome=$1, profitable=$2, outcome_type=$3,
                                 exit_price=$4, exit_return_pct=$5, exit_reason=$6,
-                                hold_duration_hours=$7, loss_pattern=$8
-                            WHERE id=$9
+                                hold_duration_hours=$7, loss_pattern=$8,
+                                resolution_price=$9, loss_reason=$10,
+                                actual_hold_days=$11
+                            WHERE id=$12
                         """,
                             exit_reason, profitable, outcome_type,
                             current_price, return_pct, exit_reason,
-                            hold_hours, loss_pattern, pos["alert_id"]
+                            hold_hours, loss_pattern,
+                            current_price, loss_reason,
+                            actual_hold_days, pos["alert_id"]
                         )
 
                         await update_risk_state(conn, profitable)
@@ -651,15 +675,10 @@ async def update_open_positions(conn):
                             "peak_return_pct": peak_return,
                             "exit_reason": exit_reason,
                             "outcome_type": outcome_type,
+                            "loss_reason": loss_reason,
                             "profitable": profitable,
                         })
 
-                        # Mirror close in simulation
-                        sim_result = await close_sim_trade(
-                            conn, pos["market_id"], current_price, exit_reason, outcome_type
-                        )
-                        if sim_result:
-                            closed[-1]["sim_result"] = sim_result
                         log.info(
                             "Position closed [%s] %s | entry=%.2f exit=%.2f return=%.1f%%",
                             outcome_type, pos["question"][:40],
@@ -671,6 +690,47 @@ async def update_open_positions(conn):
                 log.error("update_open_positions error: %s", e)
 
     return closed
+
+
+
+def derive_loss_reason(entry, resolution_price, alert_yes_price, peak_price=None):
+    """
+    Classifies WHY a losing trade lost. Called at resolution time.
+
+    WRONG_DIRECTION  — market resolved opposite to our bet
+                       (we bet YES on a <0.5 market, it resolved NO)
+    NO_MOVEMENT      — price barely changed from entry to resolution
+                       (within 10% relative move — market just sat there)
+    REVERSAL         — price moved our way at some point (peak > entry)
+                       but ultimately resolved against us
+    WRONG_DIRECTION is the most critical to identify — it means the signal
+    itself is broken, not just timing or hold duration.
+    """
+    if resolution_price is None or entry is None or entry == 0:
+        return None
+
+    price_change_pct = abs(resolution_price - entry) / entry * 100
+
+    # Was this a directional loss? (bet YES on low-prob market, resolved NO)
+    bet_yes = entry < 0.5
+    resolved_yes = resolution_price >= 0.99
+    resolved_no = resolution_price <= 0.01
+
+    if bet_yes and resolved_no:
+        return "WRONG_DIRECTION"
+    if not bet_yes and resolved_yes:
+        return "WRONG_DIRECTION"
+
+    # Price barely moved
+    if price_change_pct < 10:
+        return "NO_MOVEMENT"
+
+    # Was there ever a profitable peak before the loss?
+    if peak_price and peak_price > entry:
+        return "REVERSAL"
+
+    # Default — moved the wrong way without ever being profitable
+    return "WRONG_DIRECTION"
 
 
 async def check_resolutions(conn):
@@ -751,32 +811,54 @@ async def check_resolutions(conn):
                                                 ever_profitable = peak_p > entry_p
                                                 price_range = max(prices) - min(prices)
                                                 if ever_profitable and return_pct < 0:
-                                                    loss_pattern = "REVERSAL"  # was profitable, then lost
+                                                    loss_pattern = "REVERSAL"
                                                 elif price_range < entry_p * 0.05:
-                                                    loss_pattern = "NEVER_MOVED"  # price barely moved
+                                                    loss_pattern = "NEVER_MOVED"
                                                 elif prices[-1] < prices[0] and all(
                                                     prices[i] >= prices[i+1] for i in range(len(prices)-1)
                                                 ):
-                                                    loss_pattern = "SLOW_BLEED"  # steady decline
+                                                    loss_pattern = "SLOW_BLEED"
                                                 else:
                                                     loss_pattern = "SUDDEN_DROP"
 
                                         # Derive hold duration
                                         hold_hours = None
+                                        actual_hold_days = None
                                         alerted_at = alert.get("alerted_at")
                                         if alerted_at:
-                                            hold_hours = round(
-                                                (now() - alerted_at).total_seconds() / 3600, 1
+                                            hold_secs = (now() - alerted_at).total_seconds()
+                                            hold_hours = round(hold_secs / 3600, 1)
+                                            actual_hold_days = round(hold_secs / 86400, 2)
+
+                                        # Derive loss reason
+                                        peak_p = float(alert.get("peak_price") or 0) or None
+                                        loss_reason = None
+                                        if not profitable:
+                                            loss_reason = derive_loss_reason(
+                                                entry, final_yes,
+                                                float(alert["yes_price"]),
+                                                peak_price=peak_p
                                             )
+
+                                        # Fetch volume at resolution
+                                        vol_at_res = market.get("volume")
+                                        try:
+                                            vol_at_res = float(vol_at_res) if vol_at_res else None
+                                        except (TypeError, ValueError):
+                                            vol_at_res = None
 
                                         await conn.execute("""
                                             UPDATE alerts
                                             SET outcome=$1, profitable=$2, outcome_type=$3,
                                                 exit_price=$4, exit_return_pct=$5, exit_reason='RESOLVED',
-                                                loss_pattern=$6, hold_duration_hours=$7
-                                            WHERE id=$8
+                                                loss_pattern=$6, hold_duration_hours=$7,
+                                                resolution_price=$8, loss_reason=$9,
+                                                volume_at_resolution=$10, actual_hold_days=$11
+                                            WHERE id=$12
                                         """, outcome, profitable, outcome_type,
-                                            final_yes, return_pct, loss_pattern, hold_hours, alert["id"])
+                                            final_yes, return_pct, loss_pattern, hold_hours,
+                                            final_yes, loss_reason, vol_at_res, actual_hold_days,
+                                            alert["id"])
                                         await update_risk_state(conn, profitable)
                                     else:
                                         await conn.execute(
@@ -803,7 +885,7 @@ async def run_weekly_backtest(conn):
         SELECT category, confidence_tier, fear_greed_regime, signals_fired,
                outcome_type, exit_return_pct, peak_return_pct, profitable,
                is_backfilled, market_type, loss_pattern, hold_duration_hours,
-               hour_of_day_utc
+               hour_of_day_utc, loss_reason, actual_hold_days
         FROM alerts
         WHERE outcome IS NOT NULL
         AND alerted_at > NOW() - INTERVAL '90 days'
@@ -906,6 +988,19 @@ async def run_weekly_backtest(conn):
     lp_lines = [f"  {k}: {v}" for k, v in sorted(loss_patterns.items(), key=lambda x: -x[1])]
     lp_section = lp_lines if lp_lines else ["  No loss pattern data yet"]
 
+    # Loss reason breakdown (the actionable one)
+    loss_reasons = {}
+    for r in rows:
+        if not r["profitable"] and r.get("loss_reason"):
+            lr = r["loss_reason"]
+            loss_reasons[lr] = loss_reasons.get(lr, 0) + 1
+    total_losses = sum(loss_reasons.values())
+    lr_lines = []
+    for k, v in sorted(loss_reasons.items(), key=lambda x: -x[1]):
+        pct = round(v / total_losses * 100) if total_losses else 0
+        lr_lines.append(f"  {k}: {v} ({pct}%)")
+    lr_section = lr_lines if lr_lines else ["  No loss reason data yet"]
+
     # Avg hold duration
     hold_times = [r.get("hold_duration_hours") for r in rows if r.get("hold_duration_hours")]
     avg_hold = round(sum(hold_times) / len(hold_times), 1) if hold_times else None
@@ -949,7 +1044,10 @@ async def run_weekly_backtest(conn):
         "<b>By Signal:</b>",
     ] + sig_section + [
         "",
-        "<b>Loss Patterns:</b>",
+        "<b>Loss Reasons (Why We Lost):</b>",
+    ] + lr_section + [
+        "",
+        "<b>Loss Patterns (How Price Moved):</b>",
     ] + lp_section + [
         "",
         "<b>By Hour (UTC):</b>",
