@@ -294,7 +294,10 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     # This is the strongest signal in the bot for sports markets.
     vegas_gap = None
     vegas_implied = None
-    if category == "Sports" and sports_odds and sports_odds.get("success"):
+    # Guard: skip if YES price is near-zero/near-certain (market decided, gap is noise)
+    # or if odds fetch failed.
+    _yes_tradeable = 0.02 <= yes_price <= 0.98
+    if category == "Sports" and sports_odds and sports_odds.get("success") and _yes_tradeable:
         odds_dict = sports_odds.get("odds", {})
         question_lower = question.lower()
         for team, implied_prob in odds_dict.items():
