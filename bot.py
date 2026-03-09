@@ -15,7 +15,7 @@ from database import (
     record_alert_snapshot, cleanup_old_snapshots
 )
 from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
-from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto, get_sports_odds
+from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
     analyze_liquidity, check_cross_market_consistency,
@@ -350,6 +350,73 @@ async def main():
                     if any(kw in question_lower for kw in tennis_keywords):
                         continue
 
+                    # Short-window binaries — pure noise, no signal applies
+                    # "Bitcoin Up or Down - March 9, 3:45AM-4:00AM ET" style markets
+                    short_window_keywords = [
+                        "up or down", "pump or dump",
+                        "higher or lower", "above or below",
+                    ]
+                    if any(kw in question_lower for kw in short_window_keywords):
+                        continue
+
+                    # Coin-flip filter: YES price near 50c AND resolves in under 4 hours
+                    # These have no tradeable edge regardless of other signals
+                    try:
+                        _outcomes_chk = market.get("outcomePrices", "[0.5]")
+                        if isinstance(_outcomes_chk, str):
+                            _outcomes_chk = json.loads(_outcomes_chk)
+                        _yes_chk = float(_outcomes_chk[0]) if _outcomes_chk else 0.5
+                        _end_chk = market.get("endDate") or market.get("end_date")
+                        if _end_chk:
+                            _end_dt_chk = datetime.fromisoformat(
+                                str(_end_chk).replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            _hrs_to_res = (_end_dt_chk - now()).total_seconds() / 3600
+                            if _hrs_to_res < 4 and 0.44 <= _yes_chk <= 0.56:
+                                continue
+                    except Exception:
+                        pass
+
+                    # Minimum volume filter — $1,000 24h volume required
+                    # Too thin to trade meaningfully at $5/position
+                    if float(market.get("volume24hr", 0) or 0) < 1000:
+                        continue
+
+                    # Minimum YES price filter — skip near-zero and near-certain markets
+                    # Below 2¢ or above 98¢: market has decided, position math breaks down,
+                    # and any Vegas gap comparison becomes meaningless noise
+                    try:
+                        _outcomes_price = market.get("outcomePrices", "[0.5]")
+                        if isinstance(_outcomes_price, str):
+                            _outcomes_price = json.loads(_outcomes_price)
+                        _yes_price_chk = float(_outcomes_price[0]) if _outcomes_price else 0.5
+                        if _yes_price_chk < 0.02 or _yes_price_chk > 0.98:
+                            continue
+                    except Exception:
+                        pass
+
+                    # Futures market filter — skip season-long championship markets
+                    # Vegas h2h game odds don't apply to "Will X win the Finals/Super Bowl/etc"
+                    # These require futures odds which the Odds API h2h endpoint doesn't provide
+                    futures_keywords = [
+                        "win the nba finals", "win the nba championship",
+                        "win the super bowl", "win the world series",
+                        "win the stanley cup", "win the champions league",
+                        "win the world cup", "nba champion", "nfl champion",
+                        "2025 champion", "2026 champion", "2027 champion",
+                        "win it all", "go all the way",
+                    ]
+                    _is_futures = any(kw in question_lower for kw in futures_keywords)
+                    # Also catch "win the 2026 NBA Finals" (year injected between "the" and league)
+                    if not _is_futures:
+                        import re as _re
+                        _is_futures = bool(_re.search(
+                            r'win the \d{4} (nba|nfl|mlb|nhl|champions league|world cup|super bowl)',
+                            question_lower
+                        ))
+                    if _is_futures:
+                        continue
+
                     # Fetch price history before scoring so momentum/velocity signals
                     # can influence the score even on first evaluation
                     _market_id_pre = str(market.get("id", ""))
@@ -360,25 +427,12 @@ async def main():
                         except Exception:
                             pass
 
-                    # Fetch sports odds before scoring so Vegas divergence
-                    # influences the score directly (not just the research summary)
-                    _sports_odds_pre = None
-                    _category_pre = detect_category(market.get("question", ""))
-                    if _category_pre == "Sports" and ODDS_API_KEY:
-                        try:
-                            _sports_odds_pre = await get_sports_odds(
-                                market.get("question", ""), ODDS_API_KEY
-                            )
-                        except Exception:
-                            pass
-
                     result = score_opportunity(
                         market,
                         price_history_rows=_history_pre,
                         all_markets=active_markets,
                         upcoming_events=upcoming_events,
-                        fear_greed=fear_greed,
-                        sports_odds=_sports_odds_pre,
+                        fear_greed=fear_greed
                     )
                     score = result["score"]
                     reason = result["reason"]
@@ -425,11 +479,6 @@ async def main():
                         "ambiguity": bool(result["signals"].get("ambiguity")),
                         "lag": bool(result["signals"].get("lag")),
                         "age_hours": market_age,
-                        "spread": result["signals"].get("spread"),
-                        "vegas_gap": result["signals"].get("vegas_gap"),
-                        "days_to_resolution": result["signals"].get("days_to_resolution"),
-                        "direction": result.get("direction", "NO_EDGE"),
-                        "edge_pct": result.get("edge_pct"),
                         "final_score": score,
                     }
 
@@ -470,11 +519,6 @@ async def main():
                         "score_breakdown": score_breakdown,
                         "market_type": market_type,
                         "price_pct_of_range": price_pct_of_range,
-                        "direction": result.get("direction", "NO_EDGE"),
-                        "edge_pct": result.get("edge_pct"),
-                        "spread": result["signals"].get("spread"),
-                        "vegas_gap": result["signals"].get("vegas_gap"),
-                        "vegas_implied": result["signals"].get("vegas_implied"),
                     }
 
                     # Run analysis modules
@@ -572,10 +616,6 @@ async def main():
                         fired.append("low_liquidity")
                     if opp.get("ambiguity_warning"):
                         fired.append("ambiguous")
-                    if opp.get("vegas_gap") is not None and abs(opp["vegas_gap"]) > 10:
-                        fired.append("vegas_edge")
-                    if opp.get("spread") is not None and opp["spread"] > 0.06:
-                        fired.append("spread_wide")
                     opp["signals_fired"] = ",".join(fired)
 
                     # Log all 40+ opportunities silently
@@ -592,10 +632,8 @@ async def main():
                 if opportunities:
                     log.info("Found %d alertable opportunities", len(opportunities))
                     for opp in opportunities[:5]:
-                        edge_str = f" EDGE:{opp['edge_pct']}%" if opp.get("edge_pct") else ""
-                        log.info("Score:%d [%s] %s | %s%s",
-                                 opp["score"], opp["category"], opp["question"][:60],
-                                 opp.get("direction", "NO_EDGE"), edge_str)
+                        log.info("Score:%d [%s] %s",
+                                 opp["score"], opp["category"], opp["question"][:60])
                         if opp["id"] not in alerted_markets:
                             # First time seeing this market — log it and send alert
                             alert_id = await log_alert(
