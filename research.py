@@ -82,18 +82,21 @@ async def get_fear_greed():
                         scores_7d = [int(e.get("value", 50)) for e in entries]
                         avg_7d = round(sum(scores_7d) / len(scores_7d))
                         trend = "IMPROVING" if scores_7d[0] > scores_7d[-1] else "DECLINING"
+                        # sentiment_bonus is only applied to Crypto markets in scoring.py.
+                        # Extreme Fear = contrarian buy signal (market oversold, mispricings likely)
+                        # Extreme Greed = caution, market euphoric and overcorrected
                         if score <= 25:
                             regime = "Extreme Fear"
-                            sentiment_bonus = 0
+                            sentiment_bonus = 10   # strong contrarian signal for crypto
                         elif score <= 49:
                             regime = "Fear"
-                            sentiment_bonus = 0
+                            sentiment_bonus = 5    # mild contrarian signal
                         elif score <= 74:
                             regime = "Greed"
-                            sentiment_bonus = 0
+                            sentiment_bonus = -5   # slight caution
                         else:
                             regime = "Extreme Greed"
-                            sentiment_bonus = 0
+                            sentiment_bonus = -8   # market likely overcorrected
                         return {
                             "score": score,
                             "classification": classification,

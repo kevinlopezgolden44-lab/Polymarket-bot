@@ -15,7 +15,7 @@ from database import (
     record_alert_snapshot, cleanup_old_snapshots
 )
 from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
-from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto
+from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto, get_sports_odds
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
     analyze_liquidity, check_cross_market_consistency,
@@ -360,12 +360,25 @@ async def main():
                         except Exception:
                             pass
 
+                    # Fetch sports odds before scoring so Vegas divergence
+                    # influences the score directly (not just the research summary)
+                    _sports_odds_pre = None
+                    _category_pre = detect_category(market.get("question", ""))
+                    if _category_pre == "Sports" and ODDS_API_KEY:
+                        try:
+                            _sports_odds_pre = await get_sports_odds(
+                                market.get("question", ""), ODDS_API_KEY
+                            )
+                        except Exception:
+                            pass
+
                     result = score_opportunity(
                         market,
                         price_history_rows=_history_pre,
                         all_markets=active_markets,
                         upcoming_events=upcoming_events,
-                        fear_greed=fear_greed
+                        fear_greed=fear_greed,
+                        sports_odds=_sports_odds_pre,
                     )
                     score = result["score"]
                     reason = result["reason"]
@@ -412,6 +425,11 @@ async def main():
                         "ambiguity": bool(result["signals"].get("ambiguity")),
                         "lag": bool(result["signals"].get("lag")),
                         "age_hours": market_age,
+                        "spread": result["signals"].get("spread"),
+                        "vegas_gap": result["signals"].get("vegas_gap"),
+                        "days_to_resolution": result["signals"].get("days_to_resolution"),
+                        "direction": result.get("direction", "NO_EDGE"),
+                        "edge_pct": result.get("edge_pct"),
                         "final_score": score,
                     }
 
@@ -452,6 +470,11 @@ async def main():
                         "score_breakdown": score_breakdown,
                         "market_type": market_type,
                         "price_pct_of_range": price_pct_of_range,
+                        "direction": result.get("direction", "NO_EDGE"),
+                        "edge_pct": result.get("edge_pct"),
+                        "spread": result["signals"].get("spread"),
+                        "vegas_gap": result["signals"].get("vegas_gap"),
+                        "vegas_implied": result["signals"].get("vegas_implied"),
                     }
 
                     # Run analysis modules
@@ -549,6 +572,10 @@ async def main():
                         fired.append("low_liquidity")
                     if opp.get("ambiguity_warning"):
                         fired.append("ambiguous")
+                    if opp.get("vegas_gap") is not None and abs(opp["vegas_gap"]) > 10:
+                        fired.append("vegas_edge")
+                    if opp.get("spread") is not None and opp["spread"] > 0.06:
+                        fired.append("spread_wide")
                     opp["signals_fired"] = ",".join(fired)
 
                     # Log all 40+ opportunities silently
@@ -565,8 +592,10 @@ async def main():
                 if opportunities:
                     log.info("Found %d alertable opportunities", len(opportunities))
                     for opp in opportunities[:5]:
-                        log.info("Score:%d [%s] %s",
-                                 opp["score"], opp["category"], opp["question"][:60])
+                        edge_str = f" EDGE:{opp['edge_pct']}%" if opp.get("edge_pct") else ""
+                        log.info("Score:%d [%s] %s | %s%s",
+                                 opp["score"], opp["category"], opp["question"][:60],
+                                 opp.get("direction", "NO_EDGE"), edge_str)
                         if opp["id"] not in alerted_markets:
                             # First time seeing this market — log it and send alert
                             alert_id = await log_alert(
