@@ -19,7 +19,8 @@ from database import (
 from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
 from research import (
     get_fear_greed, build_research_summary, get_crypto_data,
-    prefetch_all_crypto, get_sports_odds
+    prefetch_all_crypto, get_sports_odds,
+    prefetch_sports_odds, detect_sport_key, FUTURES_ONLY_SPORTS,
 )
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -50,7 +51,7 @@ CONFIG = {
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
+THERUNDOWN_API_KEY = os.environ.get("THERUNDOWN_API_KEY") or os.environ.get("ODDS_API_KEY")  # ODDS_API_KEY fallback for existing deployments
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +76,7 @@ TENNIS_KEYWORDS = [
     "french open", "us open tennis", "roland garros"
 ]
 SHORT_WINDOW_KEYWORDS = ["up or down", "pump or dump", "higher or lower", "above or below"]
+OVER_UNDER_KEYWORDS   = ["o/u ", ": o/u", "over/under", "total points", "total runs", "total goals"]
 FUTURES_KEYWORDS = [
     "win the nba finals", "win the nba championship",
     "win the super bowl", "win the world series",
@@ -215,6 +217,8 @@ def _should_skip_market(question_lower):
     if any(kw in question_lower for kw in TENNIS_KEYWORDS):
         return True
     if any(kw in question_lower for kw in SHORT_WINDOW_KEYWORDS):
+        return True
+    if any(kw in question_lower for kw in OVER_UNDER_KEYWORDS):
         return True
     if any(kw in question_lower for kw in FUTURES_KEYWORDS):
         return True
@@ -371,6 +375,23 @@ async def main():
             log.info("Scanning Polymarket markets...")
             markets = await fetch_all_markets()
 
+            # Build scan-level odds cache — fetch each sport ONCE, reuse per market.
+            # Without this, 30+ sports markets = 30+ API calls per scan loop,
+            # burning through the free tier (500 requests/month) in hours.
+            _scan_odds_cache: dict = {}  # sport_key -> [games]
+            if THERUNDOWN_API_KEY and markets:
+                seen_sport_keys: set = set()
+                for _m in markets:
+                    if detect_category(_m.get("question", "")) == "Sports":
+                        _sk = detect_sport_key(_m.get("question", ""))
+                        if _sk and _sk not in FUTURES_ONLY_SPORTS and _sk not in seen_sport_keys:
+                            seen_sport_keys.add(_sk)
+                            _games = await prefetch_sports_odds(_sk, THERUNDOWN_API_KEY)
+                            if _games:
+                                _scan_odds_cache[_sk] = _games
+                if seen_sport_keys:
+                    log.info("Sports odds cached for: %s", ", ".join(seen_sport_keys))
+
             if not markets:
                 consecutive_errors += 1
                 log.warning("No markets returned (error streak: %d)", consecutive_errors)
@@ -443,17 +464,22 @@ async def main():
                         except Exception:
                             pass
 
-                    # ── FIX: Fetch sports odds BEFORE scoring so Vegas gap
-                    #         contributes to the score, not just the alert message
+                    # Detect category early so we can look up the scan-level cache
                     category = detect_category(market.get("question", ""))
                     sports_odds = None
-                    if category == "Sports" and ODDS_API_KEY:
+                    if category == "Sports" and THERUNDOWN_API_KEY:
                         try:
-                            sports_odds = await get_sports_odds(
-                                market.get("question", ""), ODDS_API_KEY
-                            )
+                            _sk = detect_sport_key(market.get("question", ""))
+                            if _sk and _sk not in FUTURES_ONLY_SPORTS:
+                                # Use already-fetched game list for this sport —
+                                # avoids a live API call per market (free tier: 500/month)
+                                _cached_games = _scan_odds_cache.get(_sk)
+                                sports_odds = await get_sports_odds(
+                                    market.get("question", ""), THERUNDOWN_API_KEY,
+                                    prefetched_games=_cached_games,
+                                )
                         except Exception as e:
-                            log.warning("Sports odds prefetch error: %s", e)
+                            log.warning("Sports odds lookup error: %s", e)
 
                     result = score_opportunity(
                         market,
@@ -686,7 +712,7 @@ async def main():
                             # For crypto the cache is already warm from prefetch.
                             research = await build_research_summary(
                                 opp["question"], opp["yes_price"],
-                                opp["category"], fear_greed, ODDS_API_KEY
+                                opp["category"], fear_greed, THERUNDOWN_API_KEY
                             )
 
                             await send_alert(

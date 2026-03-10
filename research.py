@@ -178,51 +178,11 @@ async def get_crypto_data(question: str) -> dict:
             _crypto_cache[coingecko_id] = {"data": result, "fetched_at": now()}
         return result
 
-# ── SPORTS ODDS CACHE ──────────────────────────────────────────────────────────
-# Fetched ONCE per scan per sport key, reused across all markets of that sport.
-# Prevents hitting the Odds API 30+ times per scan loop (free tier: 500/month).
-_sports_odds_cache: dict = {}
-SPORTS_CACHE_TTL_SECONDS = 300
-
-
-async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
-    """Fetch all games for a sport key and cache for the scan loop."""
-    cached = _sports_odds_cache.get(sport_key)
-    if cached:
-        age = (now() - cached["fetched_at"]).total_seconds()
-        if age < SPORTS_CACHE_TTL_SECONDS:
-            log.debug("Sports odds cache hit for %s (age %.0fs)", sport_key, age)
-            return cached["games"]
-    url = (
-        "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
-        "?apiKey=" + odds_api_key
-        + "&regions=us&markets=h2h&oddsFormat=decimal"
-    )
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    games = await resp.json()
-                    _sports_odds_cache[sport_key] = {"games": games, "fetched_at": now()}
-                    log.info("Sports odds prefetch OK: %s (%d games)", sport_key, len(games))
-                    return games
-                elif resp.status == 401:
-                    log.error("Odds API: invalid API key")
-                elif resp.status == 422:
-                    log.warning("Odds API: sport not available (%s)", sport_key)
-                elif resp.status == 429:
-                    log.warning("Odds API: rate limited")
-                else:
-                    log.warning("Odds API status %d for %s", resp.status, sport_key)
-    except Exception as e:
-        log.error("Odds API prefetch error: %s", e)
-    return []
-
-
-# ── SPORT DETECTION MAP ────────────────────────────────────────────────────────
-# Ordered — specific patterns first. NBA team nicknames included so
-# "Grizzlies vs. 76ers" is caught without an explicit "NBA" mention.
+# ── SPORT DETECTION MAP ───────────────────────────────────────────────────────
+# Ordered — specific patterns first. NBA team nicknames listed explicitly so
+# "Grizzlies vs. 76ers" is caught even without "NBA" in the question.
 SPORTS_DETECTION_MAP = [
+    # Soccer leagues + clubs
     ("champions league",    "soccer_uefa_champs_league"),
     ("premier league",      "soccer_epl"),
     ("la liga",             "soccer_spain_la_liga"),
@@ -272,7 +232,7 @@ SPORTS_DETECTION_MAP = [
     ("saints",              "americanfootball_nfl"),
     ("buccaneers",          "americanfootball_nfl"),
     ("panthers",            "americanfootball_nfl"),
-    # NBA — team nicknames first so "Grizzlies vs. 76ers" is detected
+    # NBA — team nicknames catch questions without explicit "NBA"
     ("nba",                 "basketball_nba"),
     ("lakers",              "basketball_nba"),
     ("celtics",             "basketball_nba"),
@@ -329,7 +289,7 @@ SPORTS_DETECTION_MAP = [
     ("bruins",              "icehockey_nhl"),
     ("rangers",             "icehockey_nhl"),
     ("blackhawks",          "icehockey_nhl"),
-    # Golf — futures only, no per-game h2h odds
+    # Golf — futures/outright only; no per-game h2h odds available
     ("masters",             "golf_masters_tournament_winner"),
     ("pga championship",    "golf_pga_championship"),
     ("the open",            "golf_the_open_championship"),
@@ -339,36 +299,144 @@ SPORTS_DETECTION_MAP = [
     ("mma",                 "mma_mixed_martial_arts"),
 ]
 
-# Sports that only have futures/outrights — no per-game h2h odds exist
-FUTURES_ONLY_SPORTS = {
-    "golf_masters_tournament_winner",
-    "golf_pga_championship",
-    "golf_the_open_championship",
-    "golf_pga_tour",
-    "soccer_fifa_world_cup_winner",
+# Sports that only have futures/outrights — no per-game h2h odds exist.
+# Vegas divergence doesn't apply; skip the API call entirely.
+# Sports with no per-game h2h odds (futures/outright only)
+FUTURES_ONLY_SPORTS = {18}  # FIFA World Cup — no single-game h2h markets
+
+# ── THERUNDOWN API — SPORT ID MAP ─────────────────────────────────────────────
+# TheRundown uses numeric sport IDs. Free tier: 20,000 data points/day.
+# GET /api/v2/sports/{sport_id}/events/{date}?key=KEY&market_ids=1
+# market_id=1 = moneyline (h2h). Response: events[] with teams[] and lines[].
+THERUNDOWN_SPORT_IDS = {
+    # Soccer
+    "soccer_uefa_champs_league": 16,
+    "soccer_epl":                11,
+    "soccer_spain_la_liga":      14,
+    "soccer_italy_serie_a":      15,
+    "soccer_germany_bundesliga": 13,
+    "soccer_france_ligue_one":   12,
+    "soccer_usa_mls":            10,
+    # NFL
+    "americanfootball_nfl":      2,
+    # NBA
+    "basketball_nba":            4,
+    # NCAA
+    "basketball_ncaab":          5,
+    # MLB
+    "baseball_mlb":              3,
+    # NHL
+    "icehockey_nhl":             6,
+    # MMA/UFC
+    "mma_mixed_martial_arts":    7,
 }
+
+# ── SPORTS ODDS SCAN CACHE ────────────────────────────────────────────────────
+# Fetched ONCE per scan loop per sport, reused for all markets of that sport.
+_sports_odds_cache: dict = {}
+SPORTS_CACHE_TTL_SECONDS = 300  # 5 minutes — covers one full scan loop
 
 
 def detect_sport_key(question: str) -> str | None:
-    """Returns the Odds API sport key for a question, or None if undetected."""
+    """Returns the internal sport key string for a question, or None."""
     q = question.lower()
     for keyword, key in SPORTS_DETECTION_MAP:
         if keyword in q:
             return key
     return None
 
+
+def _parse_therundown_game(event: dict) -> dict:
+    """
+    Normalise a TheRundown v2 event into the same shape our matching
+    logic expects: home_team, away_team, odds {team_name: implied_prob}.
+    """
+    teams = event.get("teams", [])
+    # TheRundown: teams[0]=away, teams[1]=home (standard convention)
+    away = teams[0].get("name", "") if len(teams) > 0 else ""
+    home = teams[1].get("name", "") if len(teams) > 1 else ""
+
+    # Find moneyline (market_id=1) lines
+    odds_data = {}
+    for line in event.get("lines", {}).values():
+        ml = line.get("moneyline", {})
+        for side, team_name in [("moneyline_home", home), ("moneyline_away", away)]:
+            price = ml.get(side)
+            if price and price != 0.0001:   # 0.0001 = TheRundown sentinel for "off the board"
+                if price > 0:
+                    # Positive American odds e.g. +150
+                    implied = round(100 / (price + 100) * 100, 1)
+                else:
+                    # Negative American odds e.g. -200
+                    implied = round(abs(price) / (abs(price) + 100) * 100, 1)
+                if team_name and team_name not in odds_data:
+                    odds_data[team_name] = implied
+        if odds_data:
+            break  # Use first sportsbook with valid lines
+
+    return {"home_team": home, "away_team": away, "odds": odds_data}
+
+
+async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
+    """
+    Fetch today's games for one sport from TheRundown and cache the result.
+    `odds_api_key` is repurposed as THERUNDOWN_API_KEY — rename the Railway
+    env var or add THERUNDOWN_API_KEY alongside the old one.
+    Returns a normalised list of game dicts (home_team, away_team, odds).
+    """
+    cached = _sports_odds_cache.get(sport_key)
+    if cached:
+        age = (now() - cached["fetched_at"]).total_seconds()
+        if age < SPORTS_CACHE_TTL_SECONDS:
+            log.debug("Sports odds cache hit for %s (age %.0fs)", sport_key, age)
+            return cached["games"]
+
+    sport_id = THERUNDOWN_SPORT_IDS.get(sport_key)
+    if sport_id is None:
+        log.warning("No TheRundown sport_id for key: %s", sport_key)
+        return []
+
+    date_str = now().strftime("%Y-%m-%d")
+    url = (
+        f"https://therundown.io/api/v2/sports/{sport_id}/events/{date_str}"
+        f"?key={odds_api_key}&market_ids=1"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    raw_events = data.get("events", [])
+                    games = [_parse_therundown_game(e) for e in raw_events]
+                    # Filter out games with no usable odds
+                    games = [g for g in games if g["odds"]]
+                    _sports_odds_cache[sport_key] = {"games": games, "fetched_at": now()}
+                    log.info("TheRundown prefetch OK: %s (%d games with odds)", sport_key, len(games))
+                    return games
+                elif resp.status == 401:
+                    log.error("TheRundown: 401 — invalid API key (check THERUNDOWN_API_KEY in Railway)")
+                elif resp.status == 429:
+                    log.warning("TheRundown: 429 — daily quota exhausted (20k/day free tier)")
+                else:
+                    log.warning("TheRundown status %d for %s", resp.status, sport_key)
+    except Exception as e:
+        log.error("TheRundown prefetch error: %s", e)
+    return []
+
+
 async def get_sports_odds(question, odds_api_key, prefetched_games: list | None = None):
     """
-    Returns Vegas h2h odds for the game matching `question`.
+    Returns Vegas h2h odds for the game best matching `question`.
+    `odds_api_key` is the THERUNDOWN_API_KEY value.
     Pass `prefetched_games` from prefetch_sports_odds() to skip the API call —
-    normal path during a scan loop to avoid per-market rate limiting.
+    normal path during a scan loop to avoid per-market requests.
     """
     if not odds_api_key:
         return {"success": False}
 
     question_lower = question.lower()
 
-    # Draw markets — h2h odds don't cover draw probability
+    # Draw markets — h2h moneyline doesn't cover draw probability
     draw_phrases = ["end in a draw", "in a draw", "result in a draw", "be a draw",
                     "draw?", "drawn match", "tied game", "end in a tie"]
     if any(p in question_lower for p in draw_phrases):
@@ -379,11 +447,11 @@ async def get_sports_odds(question, odds_api_key, prefetched_games: list | None 
         log.info("No sport detected for Vegas lookup: %s", question[:60])
         return {"success": False, "reason": "no_sport_detected"}
 
-    if sport_key in FUTURES_ONLY_SPORTS:
+    sport_id = THERUNDOWN_SPORT_IDS.get(sport_key)
+    if sport_id in FUTURES_ONLY_SPORTS:
         log.info("Futures-only sport, skipping h2h lookup: %s", sport_key)
         return {"success": False, "reason": "futures_only_sport"}
 
-    # Use prefetched game list if provided, otherwise fetch via cache
     if prefetched_games is not None:
         games = prefetched_games
     else:
@@ -392,7 +460,7 @@ async def get_sports_odds(question, odds_api_key, prefetched_games: list | None 
     if not games:
         return {"success": False, "reason": "no_games_returned"}
 
-    # Strict team matching — stop words filtered, require min score of 2
+    # Strict team matching — stop words filtered, min score of 2
     STOP_WORDS = {"will", "the", "this", "that", "game", "match", "beat",
                   "win", "wins", "lose", "play", "plays", "tonight", "week",
                   "2024", "2025", "2026", "series", "over", "home", "away"}
@@ -419,17 +487,10 @@ async def get_sports_odds(question, odds_api_key, prefetched_games: list | None 
         log.info("No confident game match (best=%d): %s", best_score, question[:60])
         return {"success": False, "reason": "no_team_match"}
 
-    bookmakers = best_match.get("bookmakers", [])
-    if not bookmakers:
+    if not best_match.get("odds"):
         return {"success": False, "reason": "no_bookmakers"}
 
-    outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
-    odds_data = {}
-    for o in outcomes:
-        implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
-        odds_data[o.get("name", "")] = implied_prob
-
-    log.info("Vegas match (score=%d): %s vs %s",
+    log.info("TheRundown match (score=%d): %s vs %s",
              best_score, best_match.get("home_team"), best_match.get("away_team"))
     return {
         "success": True,
@@ -437,9 +498,8 @@ async def get_sports_odds(question, odds_api_key, prefetched_games: list | None 
         "away_team": best_match.get("away_team", ""),
         "sport_key": sport_key,
         "match_score": best_score,
-        "odds": odds_data,
+        "odds": best_match["odds"],
     }
-
 
 def build_crypto_summary(question, yes_price, crypto_data, fear_greed):
     lines = ["Crypto Research:"]
@@ -485,7 +545,7 @@ def build_sports_summary(question, yes_price, sports_data):
         if reason == "draw_market":
             return "Sports Research: Draw market — Vegas h2h odds not applicable"
         if reason == "futures_only_sport":
-            return "Sports Research: Futures market — per-game h2h odds not available"
+            return "Sports Research: Futures/outright market — per-game h2h odds not available"
         if reason == "no_sport_detected":
             return "Sports Research: Could not detect sport type from question"
         if reason == "no_team_match":
