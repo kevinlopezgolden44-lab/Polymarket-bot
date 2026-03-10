@@ -178,130 +178,34 @@ async def get_crypto_data(question: str) -> dict:
             _crypto_cache[coingecko_id] = {"data": result, "fetched_at": now()}
         return result
 
-async def get_sports_odds(question, odds_api_key):
-    if not odds_api_key:
-        return {"success": False}
+# ── SPORTS ODDS CACHE ──────────────────────────────────────────────────────────
+# Fetched ONCE per scan per sport key, reused across all markets of that sport.
+# Prevents hitting the Odds API 30+ times per scan loop (free tier: 500/month).
+_sports_odds_cache: dict = {}
+SPORTS_CACHE_TTL_SECONDS = 300
 
-    question_lower = question.lower()
 
-    # Draw markets can't be compared to h2h Vegas odds — skip entirely
-    draw_phrases = ["end in a draw", "in a draw", "result in a draw", "be a draw",
-                    "draw?", "drawn match", "tied game", "end in a tie"]
-    if any(p in question_lower for p in draw_phrases):
-        log.info("Skipping Vegas odds for draw market: %s", question[:60])
-        return {"success": False, "reason": "draw_market"}
-
-    # Ordered list — specific keywords first, soccer clubs before generic terms
-    sports_map = [
-        ("champions league",    "soccer_uefa_champs_league"),
-        ("premier league",      "soccer_epl"),
-        ("la liga",             "soccer_spain_la_liga"),
-        ("serie a",             "soccer_italy_serie_a"),
-        ("bundesliga",          "soccer_germany_bundesliga"),
-        ("ligue 1",             "soccer_france_ligue_one"),
-        ("mls",                 "soccer_usa_mls"),
-        ("world cup",           "soccer_fifa_world_cup_winner"),
-        ("real madrid",         "soccer_spain_la_liga"),
-        ("barcelona",           "soccer_spain_la_liga"),
-        ("manchester city",     "soccer_epl"),
-        ("manchester united",   "soccer_epl"),
-        ("liverpool",           "soccer_epl"),
-        ("arsenal",             "soccer_epl"),
-        ("chelsea",             "soccer_epl"),
-        ("tottenham",           "soccer_epl"),
-        ("atletico madrid",     "soccer_spain_la_liga"),
-        ("juventus",            "soccer_italy_serie_a"),
-        ("ac milan",            "soccer_italy_serie_a"),
-        ("inter milan",         "soccer_italy_serie_a"),
-        ("bayern munich",       "soccer_germany_bundesliga"),
-        ("borussia dortmund",   "soccer_germany_bundesliga"),
-        ("paris saint-germain", "soccer_france_ligue_one"),
-        ("psg",                 "soccer_france_ligue_one"),
-        ("super bowl",          "americanfootball_nfl"),
-        ("nfl",                 "americanfootball_nfl"),
-        ("nba",                 "basketball_nba"),
-        ("march madness",       "basketball_ncaab"),
-        ("ncaa",                "basketball_ncaab"),
-        ("mlb",                 "baseball_mlb"),
-        ("world series",        "baseball_mlb"),
-        ("nhl",                 "icehockey_nhl"),
-        ("stanley cup",         "icehockey_nhl"),
-        ("ufc",                 "mma_mixed_martial_arts"),
-        ("mma",                 "mma_mixed_martial_arts"),
-    ]
-
-    sport_key = None
-    for keyword, key in sports_map:
-        if keyword in question_lower:
-            sport_key = key
-            break
-
-    if sport_key is None:
-        log.info("No sport detected for Vegas lookup: %s", question[:60])
-        return {"success": False, "reason": "no_sport_detected"}
-
-    # Strict team matching — filter stop words, require min score of 2
-    STOP_WORDS = {"will", "the", "this", "that", "game", "match", "beat",
-                  "win", "wins", "lose", "play", "plays", "tonight", "week",
-                  "2024", "2025", "2026", "series", "over", "home", "away"}
-    question_words = [
-        w for w in re.findall(r"[a-z]+", question_lower)
-        if len(w) >= 4 and w not in STOP_WORDS
-    ]
-
+async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
+    """Fetch all games for a sport key and cache for the scan loop."""
+    cached = _sports_odds_cache.get(sport_key)
+    if cached:
+        age = (now() - cached["fetched_at"]).total_seconds()
+        if age < SPORTS_CACHE_TTL_SECONDS:
+            log.debug("Sports odds cache hit for %s (age %.0fs)", sport_key, age)
+            return cached["games"]
+    url = (
+        "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
+        "?apiKey=" + odds_api_key
+        + "&regions=us&markets=h2h&oddsFormat=decimal"
+    )
     try:
-        url = (
-            "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
-            "?apiKey=" + odds_api_key
-            + "&regions=us&markets=h2h&oddsFormat=decimal"
-        )
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     games = await resp.json()
-                    if not games:
-                        return {"success": False, "reason": "no_games_returned"}
-
-                    best_match = None
-                    best_score = 0
-                    for game in games:
-                        home = game.get("home_team", "").lower()
-                        away = game.get("away_team", "").lower()
-                        combined = home + " " + away
-                        match_score = sum(1 for w in question_words if w in combined)
-                        # Bonus for full team name match
-                        if home in question_lower or away in question_lower:
-                            match_score += 5
-                        if match_score > best_score:
-                            best_score = match_score
-                            best_match = game
-
-                    MIN_MATCH_SCORE = 2
-                    if not best_match or best_score < MIN_MATCH_SCORE:
-                        log.info("No confident game match (best=%d): %s", best_score, question[:60])
-                        return {"success": False, "reason": "no_team_match"}
-
-                    bookmakers = best_match.get("bookmakers", [])
-                    if not bookmakers:
-                        return {"success": False, "reason": "no_bookmakers"}
-
-                    outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
-                    odds_data = {}
-                    for o in outcomes:
-                        implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
-                        odds_data[o.get("name", "")] = implied_prob
-
-                    log.info("Vegas match (score=%d): %s vs %s",
-                             best_score, best_match.get("home_team"), best_match.get("away_team"))
-                    return {
-                        "success": True,
-                        "home_team": best_match.get("home_team", ""),
-                        "away_team": best_match.get("away_team", ""),
-                        "sport_key": sport_key,
-                        "match_score": best_score,
-                        "odds": odds_data,
-                    }
-
+                    _sports_odds_cache[sport_key] = {"games": games, "fetched_at": now()}
+                    log.info("Sports odds prefetch OK: %s (%d games)", sport_key, len(games))
+                    return games
                 elif resp.status == 401:
                     log.error("Odds API: invalid API key")
                 elif resp.status == 422:
@@ -310,10 +214,232 @@ async def get_sports_odds(question, odds_api_key):
                     log.warning("Odds API: rate limited")
                 else:
                     log.warning("Odds API status %d for %s", resp.status, sport_key)
-
     except Exception as e:
-        log.error("Odds API error: %s", e)
-    return {"success": False}
+        log.error("Odds API prefetch error: %s", e)
+    return []
+
+
+# ── SPORT DETECTION MAP ────────────────────────────────────────────────────────
+# Ordered — specific patterns first. NBA team nicknames included so
+# "Grizzlies vs. 76ers" is caught without an explicit "NBA" mention.
+SPORTS_DETECTION_MAP = [
+    ("champions league",    "soccer_uefa_champs_league"),
+    ("premier league",      "soccer_epl"),
+    ("la liga",             "soccer_spain_la_liga"),
+    ("serie a",             "soccer_italy_serie_a"),
+    ("bundesliga",          "soccer_germany_bundesliga"),
+    ("ligue 1",             "soccer_france_ligue_one"),
+    ("mls",                 "soccer_usa_mls"),
+    ("world cup",           "soccer_fifa_world_cup_winner"),
+    ("real madrid",         "soccer_spain_la_liga"),
+    ("barcelona",           "soccer_spain_la_liga"),
+    ("manchester city",     "soccer_epl"),
+    ("manchester united",   "soccer_epl"),
+    ("liverpool",           "soccer_epl"),
+    ("arsenal",             "soccer_epl"),
+    ("chelsea",             "soccer_epl"),
+    ("tottenham",           "soccer_epl"),
+    ("atletico madrid",     "soccer_spain_la_liga"),
+    ("juventus",            "soccer_italy_serie_a"),
+    ("ac milan",            "soccer_italy_serie_a"),
+    ("inter milan",         "soccer_italy_serie_a"),
+    ("bayern munich",       "soccer_germany_bundesliga"),
+    ("borussia dortmund",   "soccer_germany_bundesliga"),
+    ("paris saint-germain", "soccer_france_ligue_one"),
+    ("psg",                 "soccer_france_ligue_one"),
+    # NFL
+    ("super bowl",          "americanfootball_nfl"),
+    ("nfl",                 "americanfootball_nfl"),
+    ("chiefs",              "americanfootball_nfl"),
+    ("eagles",              "americanfootball_nfl"),
+    ("cowboys",             "americanfootball_nfl"),
+    ("patriots",            "americanfootball_nfl"),
+    ("49ers",               "americanfootball_nfl"),
+    ("packers",             "americanfootball_nfl"),
+    ("ravens",              "americanfootball_nfl"),
+    ("bills",               "americanfootball_nfl"),
+    ("broncos",             "americanfootball_nfl"),
+    ("steelers",            "americanfootball_nfl"),
+    ("raiders",             "americanfootball_nfl"),
+    ("seahawks",            "americanfootball_nfl"),
+    ("rams",                "americanfootball_nfl"),
+    ("chargers",            "americanfootball_nfl"),
+    ("dolphins",            "americanfootball_nfl"),
+    ("bears",               "americanfootball_nfl"),
+    ("lions",               "americanfootball_nfl"),
+    ("vikings",             "americanfootball_nfl"),
+    ("falcons",             "americanfootball_nfl"),
+    ("saints",              "americanfootball_nfl"),
+    ("buccaneers",          "americanfootball_nfl"),
+    ("panthers",            "americanfootball_nfl"),
+    # NBA — team nicknames first so "Grizzlies vs. 76ers" is detected
+    ("nba",                 "basketball_nba"),
+    ("lakers",              "basketball_nba"),
+    ("celtics",             "basketball_nba"),
+    ("warriors",            "basketball_nba"),
+    ("bucks",               "basketball_nba"),
+    ("nets",                "basketball_nba"),
+    ("heat",                "basketball_nba"),
+    ("suns",                "basketball_nba"),
+    ("nuggets",             "basketball_nba"),
+    ("clippers",            "basketball_nba"),
+    ("76ers",               "basketball_nba"),
+    ("sixers",              "basketball_nba"),
+    ("knicks",              "basketball_nba"),
+    ("bulls",               "basketball_nba"),
+    ("spurs",               "basketball_nba"),
+    ("mavericks",           "basketball_nba"),
+    ("mavs",                "basketball_nba"),
+    ("grizzlies",           "basketball_nba"),
+    ("rockets",             "basketball_nba"),
+    ("thunder",             "basketball_nba"),
+    ("trail blazers",       "basketball_nba"),
+    ("blazers",             "basketball_nba"),
+    ("timberwolves",        "basketball_nba"),
+    ("pistons",             "basketball_nba"),
+    ("hornets",             "basketball_nba"),
+    ("wizards",             "basketball_nba"),
+    ("magic",               "basketball_nba"),
+    ("hawks",               "basketball_nba"),
+    ("jazz",                "basketball_nba"),
+    ("kings",               "basketball_nba"),
+    ("pelicans",            "basketball_nba"),
+    ("cavaliers",           "basketball_nba"),
+    ("cavs",                "basketball_nba"),
+    ("raptors",             "basketball_nba"),
+    ("pacers",              "basketball_nba"),
+    # NCAA
+    ("march madness",       "basketball_ncaab"),
+    ("ncaa",                "basketball_ncaab"),
+    # MLB
+    ("mlb",                 "baseball_mlb"),
+    ("world series",        "baseball_mlb"),
+    ("yankees",             "baseball_mlb"),
+    ("dodgers",             "baseball_mlb"),
+    ("red sox",             "baseball_mlb"),
+    ("cubs",                "baseball_mlb"),
+    ("astros",              "baseball_mlb"),
+    ("braves",              "baseball_mlb"),
+    ("mets",                "baseball_mlb"),
+    # NHL
+    ("nhl",                 "icehockey_nhl"),
+    ("stanley cup",         "icehockey_nhl"),
+    ("maple leafs",         "icehockey_nhl"),
+    ("canadiens",           "icehockey_nhl"),
+    ("bruins",              "icehockey_nhl"),
+    ("rangers",             "icehockey_nhl"),
+    ("blackhawks",          "icehockey_nhl"),
+    # Golf — futures only, no per-game h2h odds
+    ("masters",             "golf_masters_tournament_winner"),
+    ("pga championship",    "golf_pga_championship"),
+    ("the open",            "golf_the_open_championship"),
+    ("pga tour",            "golf_pga_tour"),
+    # MMA/UFC
+    ("ufc",                 "mma_mixed_martial_arts"),
+    ("mma",                 "mma_mixed_martial_arts"),
+]
+
+# Sports that only have futures/outrights — no per-game h2h odds exist
+FUTURES_ONLY_SPORTS = {
+    "golf_masters_tournament_winner",
+    "golf_pga_championship",
+    "golf_the_open_championship",
+    "golf_pga_tour",
+    "soccer_fifa_world_cup_winner",
+}
+
+
+def detect_sport_key(question: str) -> str | None:
+    """Returns the Odds API sport key for a question, or None if undetected."""
+    q = question.lower()
+    for keyword, key in SPORTS_DETECTION_MAP:
+        if keyword in q:
+            return key
+    return None
+
+async def get_sports_odds(question, odds_api_key, prefetched_games: list | None = None):
+    """
+    Returns Vegas h2h odds for the game matching `question`.
+    Pass `prefetched_games` from prefetch_sports_odds() to skip the API call —
+    normal path during a scan loop to avoid per-market rate limiting.
+    """
+    if not odds_api_key:
+        return {"success": False}
+
+    question_lower = question.lower()
+
+    # Draw markets — h2h odds don't cover draw probability
+    draw_phrases = ["end in a draw", "in a draw", "result in a draw", "be a draw",
+                    "draw?", "drawn match", "tied game", "end in a tie"]
+    if any(p in question_lower for p in draw_phrases):
+        return {"success": False, "reason": "draw_market"}
+
+    sport_key = detect_sport_key(question)
+    if sport_key is None:
+        log.info("No sport detected for Vegas lookup: %s", question[:60])
+        return {"success": False, "reason": "no_sport_detected"}
+
+    if sport_key in FUTURES_ONLY_SPORTS:
+        log.info("Futures-only sport, skipping h2h lookup: %s", sport_key)
+        return {"success": False, "reason": "futures_only_sport"}
+
+    # Use prefetched game list if provided, otherwise fetch via cache
+    if prefetched_games is not None:
+        games = prefetched_games
+    else:
+        games = await prefetch_sports_odds(sport_key, odds_api_key)
+
+    if not games:
+        return {"success": False, "reason": "no_games_returned"}
+
+    # Strict team matching — stop words filtered, require min score of 2
+    STOP_WORDS = {"will", "the", "this", "that", "game", "match", "beat",
+                  "win", "wins", "lose", "play", "plays", "tonight", "week",
+                  "2024", "2025", "2026", "series", "over", "home", "away"}
+    question_words = [
+        w for w in re.findall(r"[a-z]+", question_lower)
+        if len(w) >= 4 and w not in STOP_WORDS
+    ]
+
+    best_match = None
+    best_score = 0
+    for game in games:
+        home = game.get("home_team", "").lower()
+        away = game.get("away_team", "").lower()
+        combined = home + " " + away
+        match_score = sum(1 for w in question_words if w in combined)
+        if home in question_lower or away in question_lower:
+            match_score += 5
+        if match_score > best_score:
+            best_score = match_score
+            best_match = game
+
+    MIN_MATCH_SCORE = 2
+    if not best_match or best_score < MIN_MATCH_SCORE:
+        log.info("No confident game match (best=%d): %s", best_score, question[:60])
+        return {"success": False, "reason": "no_team_match"}
+
+    bookmakers = best_match.get("bookmakers", [])
+    if not bookmakers:
+        return {"success": False, "reason": "no_bookmakers"}
+
+    outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
+    odds_data = {}
+    for o in outcomes:
+        implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
+        odds_data[o.get("name", "")] = implied_prob
+
+    log.info("Vegas match (score=%d): %s vs %s",
+             best_score, best_match.get("home_team"), best_match.get("away_team"))
+    return {
+        "success": True,
+        "home_team": best_match.get("home_team", ""),
+        "away_team": best_match.get("away_team", ""),
+        "sport_key": sport_key,
+        "match_score": best_score,
+        "odds": odds_data,
+    }
+
 
 def build_crypto_summary(question, yes_price, crypto_data, fear_greed):
     lines = ["Crypto Research:"]
@@ -358,6 +484,8 @@ def build_sports_summary(question, yes_price, sports_data):
     if not sports_data.get("success"):
         if reason == "draw_market":
             return "Sports Research: Draw market — Vegas h2h odds not applicable"
+        if reason == "futures_only_sport":
+            return "Sports Research: Futures market — per-game h2h odds not available"
         if reason == "no_sport_detected":
             return "Sports Research: Could not detect sport type from question"
         if reason == "no_team_match":
