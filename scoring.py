@@ -413,6 +413,8 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         "category": category,
         "market_type": market_type,
         "confidence": confidence,
+        "confirming": confirming,       # exposed so bot.py can seed its tier calculation
+        "contradicting": contradicting,
         "direction": direction,
         "edge_pct": edge_pct,
         "flags": flags,

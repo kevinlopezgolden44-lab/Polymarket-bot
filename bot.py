@@ -13,7 +13,8 @@ from database import (
     log_sentiment, get_daily_stats, get_alerted_markets,
     get_logged_opportunities, check_resolutions,
     update_open_positions, run_weekly_backtest,
-    record_alert_snapshot, cleanup_old_snapshots
+    record_alert_snapshot, cleanup_old_snapshots,
+    update_risk_state,
 )
 from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
 from research import (
@@ -323,6 +324,17 @@ async def main():
                 log.info("Running resolution check...")
                 async with pool.acquire() as conn:
                     resolved_count = await check_resolutions(conn)
+                    # Update win/loss streaks for each newly resolved market
+                    if resolved_count > 0:
+                        recently_resolved = await conn.fetch("""
+                            SELECT profitable FROM alerts
+                            WHERE outcome IS NOT NULL
+                            ORDER BY alerted_at DESC
+                            LIMIT $1
+                        """, resolved_count)
+                        for row in recently_resolved:
+                            if row["profitable"] is not None:
+                                await update_risk_state(conn, row["profitable"])
                 last_resolution_hours.add(resolution_key)
                 if len(last_resolution_hours) > 100:
                     last_resolution_hours = set(list(last_resolution_hours)[-50:])
@@ -558,8 +570,10 @@ async def main():
                         opp["inconsistencies"] = inconsistencies
 
                     # ── Price history analysis ─────────────────────────────────
-                    confirming = 0
-                    contradicting = 0
+                    # Seed confirming/contradicting from scoring.py's counts so that
+                    # liquidity, spread, ambiguity, days-to-resolution etc. are included.
+                    confirming = result.get("confirming", 0)
+                    contradicting = result.get("contradicting", 0)
 
                     if market_id in alerted_markets:
                         async with pool.acquire() as conn:

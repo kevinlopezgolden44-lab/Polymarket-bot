@@ -167,8 +167,14 @@ async def send_status(token, chat_id, conn):
             else:
                 cat_stats[cat] = "0% (0)"
 
-        high_conf = [a for a in resolved if a.get("confidence_tier") == "HIGH"]
-        high_win = round(sum(1 for a in high_conf if a["profitable"]) / len(high_conf) * 100) if high_conf else 0
+        high_conf   = [a for a in resolved if a.get("confidence_tier") == "HIGH"]
+        medium_conf = [a for a in resolved if a.get("confidence_tier") == "MEDIUM"]
+        low_conf    = [a for a in resolved if a.get("confidence_tier") == "LOW"]
+        def tier_win(group):
+            return round(sum(1 for a in group if a["profitable"]) / len(group) * 100) if group else 0
+        high_win   = tier_win(high_conf)
+        medium_win = tier_win(medium_conf)
+        low_win    = tier_win(low_conf)
 
         fear_res = [a for a in resolved if a.get("fear_greed_regime") in ["Extreme Fear", "Fear"]]
         greed_res = [a for a in resolved if a.get("fear_greed_regime") in ["Greed", "Extreme Greed"]]
@@ -196,7 +202,7 @@ async def send_status(token, chat_id, conn):
             + "Avg Exit Return: " + avg_return_str + "\n"
             + "Avg Peak Return: " + avg_peak_str + "\n"
             + "Open Positions: " + str(open_positions) + "\n"
-            + "Live Tracked: " + str(len(live_resolved)) + " / " + str(len(resolved)) + " resolved\n\n"
+            + "Live Tracked: " + str(len(live_resolved)) + " still open / " + str(len(resolved)) + " resolved\n\n"
             + "<b>Outcome Breakdown:</b>\n"
             + outcome_lines
             + "\n<b>Win Rate by Category:</b>\n"
@@ -206,13 +212,18 @@ async def send_status(token, chat_id, conn):
 
         msg += (
             "\n<b>Confidence Tiers:</b>\n"
-            + "  HIGH: " + str(high_win) + "% (" + str(len(high_conf)) + " resolved)\n\n"
+            + "  🔥 HIGH:   " + str(high_win)   + "% (" + str(len(high_conf))   + " resolved)\n"
+            + "  ⚡ MEDIUM: " + str(medium_win) + "% (" + str(len(medium_conf)) + " resolved)\n"
+            + "  💡 LOW:    " + str(low_win)    + "% (" + str(len(low_conf))    + " resolved)\n\n"
             + "<b>Sentiment Win Rates:</b>\n"
             + "  During Fear: " + str(fear_win) + "% (" + str(len(fear_res)) + ")\n"
             + "  During Greed: " + str(greed_win) + "% (" + str(len(greed_res)) + ")\n\n"
-            + "<b>Your Judgment:</b>\n"
-            + "  When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
-            + "  When disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
+            + (
+                "<b>Your Judgment:</b>\n"
+                + "  When agreed: " + str(agreed_win) + "% (" + str(len(agreed)) + " rated)\n"
+                + "  When disagreed: " + str(disagreed_win) + "% (" + str(len(disagreed)) + " rated)\n\n"
+                if (agreed or disagreed) else ""
+            )
             + "<b>Risk Limits:</b>\n"
             + "  Max trade: $" + str(limits["max_trade_size"]) + "\n"
             + "  Max daily loss: $" + str(limits["max_daily_loss"]) + "\n"
