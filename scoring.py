@@ -138,15 +138,17 @@ def detect_market_type(question):
     """
     q = question.lower()
 
+    # DOMINANCE must be checked before PRICE_TARGET — "exceed 60%" would otherwise
+    # match PRICE_TARGET since it contains digits and "exceed"
+    if "dominance" in q:
+        return "DOMINANCE"
+
     if any(w in q for w in ["reach", "hit", "exceed", "above", "below", "dip", "drop to", "fall to"]):
         if "$" in q or any(c.isdigit() for c in q):
             return "PRICE_TARGET"
 
     if any(w in q for w in ["gain", "rise", "increase", "grow", "pump"]) and "%" in q:
         return "PERCENTAGE_MOVE"
-
-    if "dominance" in q:
-        return "DOMINANCE"
 
     if any(w in q for w in ["etf", "approve", "approved", "launch", "halving",
                               "fork", "upgrade", "ban", "regulate", "sec", "lawsuit"]):

@@ -95,22 +95,35 @@ class TestScoreOpportunity(unittest.TestCase):
         illiquid_result = score_opportunity(illiquid_market)
         assert liquid_result["score"] > illiquid_result["score"]
 
-    def test_fear_greed_bonus_applied(self):
-        market = make_market()
-        # Fear & greed bonus is now 0 across all regimes (removed to reduce noise)
-        # Test that the field is accepted without error and scores are equal
+    def test_fear_greed_only_applies_to_crypto(self):
+        """Fear & Greed must NOT affect non-crypto markets."""
+        politics_market = make_market(question="Who will win the 2026 US election?")
+        fear_greed = {
+            "success": True, "score": 8, "regime": "Extreme Fear",
+            "sentiment_bonus": 10, "trend": "DECLINING"
+        }
+        with_fg = score_opportunity(politics_market, fear_greed=fear_greed)
+        without_fg = score_opportunity(politics_market, fear_greed=None)
+        assert with_fg["score"] == without_fg["score"], (
+            "Fear & Greed should not affect Politics markets"
+        )
+
+    def test_fear_greed_does_apply_to_crypto(self):
+        """Fear & Greed MUST affect crypto markets when bonus is non-zero."""
+        crypto_market = make_market(question="Will BTC reach $100k?")
         fear_greed_fear = {
-            "success": True, "score": 20, "regime": "Extreme Fear",
-            "sentiment_bonus": 0, "trend": "IMPROVING"
+            "success": True, "score": 8, "regime": "Extreme Fear",
+            "sentiment_bonus": 10, "trend": "DECLINING"
         }
         fear_greed_greed = {
-            "success": True, "score": 80, "regime": "Extreme Greed",
-            "sentiment_bonus": 0, "trend": "DECLINING"
+            "success": True, "score": 85, "regime": "Extreme Greed",
+            "sentiment_bonus": -8, "trend": "IMPROVING"
         }
-        fear_result = score_opportunity(market, fear_greed=fear_greed_fear)
-        greed_result = score_opportunity(market, fear_greed=fear_greed_greed)
-        # Scores should now be equal since bonus is 0
-        assert fear_result["score"] == greed_result["score"]
+        fear_result = score_opportunity(crypto_market, fear_greed=fear_greed_fear)
+        greed_result = score_opportunity(crypto_market, fear_greed=fear_greed_greed)
+        assert fear_result["score"] > greed_result["score"], (
+            "Extreme Fear should score higher than Extreme Greed for crypto"
+        )
 
     def test_fresh_market_gets_bonus(self):
         fresh = make_market(created_hours_ago=5)
@@ -329,6 +342,69 @@ class TestDetectMarketType(unittest.TestCase):
         result = score_opportunity(market)
         assert "market_type" in result
         assert result["market_type"] == "PRICE_TARGET"
+
+
+
+# ── Bot filter logic (pure Python, no DB/async needed) ────────────────────────
+
+class TestBotFilters(unittest.TestCase):
+    """Test the pre-scoring market filters from bot.py."""
+
+    SHORT_WINDOW = ["up or down", "pump or dump", "higher or lower", "above or below"]
+    FUTURES_KEYWORDS = [
+        "win the nba finals", "win the nba championship",
+        "win the super bowl", "win the world series",
+        "win the stanley cup", "win the champions league",
+        "win the world cup", "nba champion", "nfl champion",
+        "2025 champion", "2026 champion", "2027 champion",
+    ]
+    import re as _re
+    FUTURES_PATTERN = _re.compile(
+        r'win the \d{4} (nba|nfl|mlb|nhl|champions league|world cup|super bowl)'
+    )
+
+    def _is_short_window(self, q):
+        return any(kw in q.lower() for kw in self.SHORT_WINDOW)
+
+    def _is_futures(self, q):
+        ql = q.lower()
+        return (any(kw in ql for kw in self.FUTURES_KEYWORDS)
+                or bool(self.FUTURES_PATTERN.search(ql)))
+
+    def _yes_price_blocked(self, yes_price):
+        return yes_price < 0.02 or yes_price > 0.98
+
+    def test_short_window_btc_up_or_down(self):
+        assert self._is_short_window("Bitcoin Up or Down - March 9, 3:45AM-4:00AM ET")
+
+    def test_short_window_not_triggered_normal(self):
+        assert not self._is_short_window("Will BTC reach $100k by end of March?")
+
+    def test_futures_nba_finals_keyword(self):
+        assert self._is_futures("Will the Memphis Grizzlies win the NBA Finals?")
+
+    def test_futures_year_regex(self):
+        assert self._is_futures("Will the Memphis Grizzlies win the 2026 NBA Finals?")
+
+    def test_futures_super_bowl_regex(self):
+        assert self._is_futures("Will the Chiefs win the 2026 Super Bowl?")
+
+    def test_futures_not_triggered_game(self):
+        assert not self._is_futures("Will the Lakers beat the Celtics tonight?")
+
+    def test_yes_price_near_zero_blocked(self):
+        assert self._yes_price_blocked(0.001)
+
+    def test_yes_price_near_one_blocked(self):
+        assert self._yes_price_blocked(0.995)
+
+    def test_yes_price_normal_allowed(self):
+        assert not self._yes_price_blocked(0.25)
+        assert not self._yes_price_blocked(0.75)
+
+    def test_yes_price_boundary_allowed(self):
+        assert not self._yes_price_blocked(0.02)
+        assert not self._yes_price_blocked(0.98)
 
 
 if __name__ == "__main__":

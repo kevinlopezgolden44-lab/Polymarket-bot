@@ -181,25 +181,74 @@ async def get_crypto_data(question: str) -> dict:
 async def get_sports_odds(question, odds_api_key):
     if not odds_api_key:
         return {"success": False}
-    sports_map = {
-        "nba": "basketball_nba",
-        "nfl": "americanfootball_nfl",
-        "mlb": "baseball_mlb",
-        "nhl": "icehockey_nhl",
-        "ufc": "mma_mixed_martial_arts",
-        "premier league": "soccer_epl",
-        "champions league": "soccer_uefa_champs_league",
-        "world cup": "soccer_fifa_world_cup_winner",
-        "super bowl": "americanfootball_nfl",
-        "march madness": "basketball_ncaab",
-        "ncaa": "basketball_ncaab"
-    }
-    sport_key = "basketball_nba"
+
     question_lower = question.lower()
-    for keyword, key in sports_map.items():
+
+    # Draw markets can't be compared to h2h Vegas odds — skip entirely
+    draw_phrases = ["end in a draw", "in a draw", "result in a draw", "be a draw",
+                    "draw?", "drawn match", "tied game", "end in a tie"]
+    if any(p in question_lower for p in draw_phrases):
+        log.info("Skipping Vegas odds for draw market: %s", question[:60])
+        return {"success": False, "reason": "draw_market"}
+
+    # Ordered list — specific keywords first, soccer clubs before generic terms
+    sports_map = [
+        ("champions league",    "soccer_uefa_champs_league"),
+        ("premier league",      "soccer_epl"),
+        ("la liga",             "soccer_spain_la_liga"),
+        ("serie a",             "soccer_italy_serie_a"),
+        ("bundesliga",          "soccer_germany_bundesliga"),
+        ("ligue 1",             "soccer_france_ligue_one"),
+        ("mls",                 "soccer_usa_mls"),
+        ("world cup",           "soccer_fifa_world_cup_winner"),
+        ("real madrid",         "soccer_spain_la_liga"),
+        ("barcelona",           "soccer_spain_la_liga"),
+        ("manchester city",     "soccer_epl"),
+        ("manchester united",   "soccer_epl"),
+        ("liverpool",           "soccer_epl"),
+        ("arsenal",             "soccer_epl"),
+        ("chelsea",             "soccer_epl"),
+        ("tottenham",           "soccer_epl"),
+        ("atletico madrid",     "soccer_spain_la_liga"),
+        ("juventus",            "soccer_italy_serie_a"),
+        ("ac milan",            "soccer_italy_serie_a"),
+        ("inter milan",         "soccer_italy_serie_a"),
+        ("bayern munich",       "soccer_germany_bundesliga"),
+        ("borussia dortmund",   "soccer_germany_bundesliga"),
+        ("paris saint-germain", "soccer_france_ligue_one"),
+        ("psg",                 "soccer_france_ligue_one"),
+        ("super bowl",          "americanfootball_nfl"),
+        ("nfl",                 "americanfootball_nfl"),
+        ("nba",                 "basketball_nba"),
+        ("march madness",       "basketball_ncaab"),
+        ("ncaa",                "basketball_ncaab"),
+        ("mlb",                 "baseball_mlb"),
+        ("world series",        "baseball_mlb"),
+        ("nhl",                 "icehockey_nhl"),
+        ("stanley cup",         "icehockey_nhl"),
+        ("ufc",                 "mma_mixed_martial_arts"),
+        ("mma",                 "mma_mixed_martial_arts"),
+    ]
+
+    sport_key = None
+    for keyword, key in sports_map:
         if keyword in question_lower:
             sport_key = key
             break
+
+    if sport_key is None:
+        log.info("No sport detected for Vegas lookup: %s", question[:60])
+        return {"success": False, "reason": "no_sport_detected"}
+
+    # Strict team matching — filter stop words, require min score of 2
+    STOP_WORDS = {"will", "the", "this", "that", "game", "match", "beat",
+                  "win", "wins", "lose", "play", "plays", "tonight", "week",
+                  "2024", "2025", "2026", "series", "over", "home", "away"}
+    question_words = [
+        w for w in re.findall(r"[a-z]+", question_lower)
+        if len(w) >= 4 and w not in STOP_WORDS
+    ]
+
     try:
         url = (
             "https://api.the-odds-api.com/v4/sports/" + sport_key + "/odds"
@@ -210,31 +259,58 @@ async def get_sports_odds(question, odds_api_key):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     games = await resp.json()
-                    if games:
-                        words = question_lower.split()
-                        best_match = None
-                        best_score = 0
-                        for game in games:
-                            home = game.get("home_team", "").lower()
-                            away = game.get("away_team", "").lower()
-                            match_score = sum(1 for w in words if w in home or w in away)
-                            if match_score > best_score:
-                                best_score = match_score
-                                best_match = game
-                        if best_match and best_score >= 1:
-                            bookmakers = best_match.get("bookmakers", [])
-                            if bookmakers:
-                                outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
-                                odds_data = {}
-                                for o in outcomes:
-                                    implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
-                                    odds_data[o.get("name", "")] = implied_prob
-                                return {
-                                    "success": True,
-                                    "home_team": best_match.get("home_team", ""),
-                                    "away_team": best_match.get("away_team", ""),
-                                    "odds": odds_data
-                                }
+                    if not games:
+                        return {"success": False, "reason": "no_games_returned"}
+
+                    best_match = None
+                    best_score = 0
+                    for game in games:
+                        home = game.get("home_team", "").lower()
+                        away = game.get("away_team", "").lower()
+                        combined = home + " " + away
+                        match_score = sum(1 for w in question_words if w in combined)
+                        # Bonus for full team name match
+                        if home in question_lower or away in question_lower:
+                            match_score += 5
+                        if match_score > best_score:
+                            best_score = match_score
+                            best_match = game
+
+                    MIN_MATCH_SCORE = 2
+                    if not best_match or best_score < MIN_MATCH_SCORE:
+                        log.info("No confident game match (best=%d): %s", best_score, question[:60])
+                        return {"success": False, "reason": "no_team_match"}
+
+                    bookmakers = best_match.get("bookmakers", [])
+                    if not bookmakers:
+                        return {"success": False, "reason": "no_bookmakers"}
+
+                    outcomes = bookmakers[0].get("markets", [{}])[0].get("outcomes", [])
+                    odds_data = {}
+                    for o in outcomes:
+                        implied_prob = round(1 / float(o.get("price", 2.0)) * 100, 1)
+                        odds_data[o.get("name", "")] = implied_prob
+
+                    log.info("Vegas match (score=%d): %s vs %s",
+                             best_score, best_match.get("home_team"), best_match.get("away_team"))
+                    return {
+                        "success": True,
+                        "home_team": best_match.get("home_team", ""),
+                        "away_team": best_match.get("away_team", ""),
+                        "sport_key": sport_key,
+                        "match_score": best_score,
+                        "odds": odds_data,
+                    }
+
+                elif resp.status == 401:
+                    log.error("Odds API: invalid API key")
+                elif resp.status == 422:
+                    log.warning("Odds API: sport not available (%s)", sport_key)
+                elif resp.status == 429:
+                    log.warning("Odds API: rate limited")
+                else:
+                    log.warning("Odds API status %d for %s", resp.status, sport_key)
+
     except Exception as e:
         log.error("Odds API error: %s", e)
     return {"success": False}
@@ -278,34 +354,58 @@ def build_crypto_summary(question, yes_price, crypto_data, fear_greed):
     return "\n".join(lines)
 
 def build_sports_summary(question, yes_price, sports_data):
+    reason = sports_data.get("reason", "")
     if not sports_data.get("success"):
+        if reason == "draw_market":
+            return "Sports Research: Draw market — Vegas h2h odds not applicable"
+        if reason == "no_sport_detected":
+            return "Sports Research: Could not detect sport type from question"
+        if reason == "no_team_match":
+            return "Sports Research: Could not match question to a live game"
         return "Sports Research: Could not fetch live odds"
+
     lines = ["Sports Research:"]
     home = sports_data["home_team"]
     away = sports_data["away_team"]
     odds = sports_data["odds"]
-    lines.append("Matchup: " + away + " vs " + home)
+    sport_key = sports_data.get("sport_key", "")
+    match_score = sports_data.get("match_score", 0)
+    lines.append(f"Matched: {away} vs {home} [{sport_key}, confidence:{match_score}]")
+
     question_lower = question.lower()
     matched_team = None
     matched_prob = None
+    # Strict: require full team name words to appear in question
     for team, prob in odds.items():
-        if any(word in question_lower for word in team.lower().split()):
+        team_words = [w for w in team.lower().split() if len(w) >= 4]
+        if team_words and all(w in question_lower for w in team_words):
             matched_team = team
             matched_prob = prob
             break
+    # Fallback: any meaningful word
+    if not matched_team:
+        for team, prob in odds.items():
+            if any(w in question_lower for w in team.lower().split() if len(w) >= 5):
+                matched_team = team
+                matched_prob = prob
+                break
+
     for team, prob in odds.items():
-        lines.append("Vegas: " + team + " " + str(prob) + "%")
+        lines.append(f"Vegas: {team} {prob}%")
+
     if matched_team and matched_prob:
         polymarket_pct = round(yes_price * 100, 1)
         gap = round(matched_prob - polymarket_pct, 1)
-        lines.append("Polymarket YES: " + str(polymarket_pct) + "%")
-        lines.append("Vegas implied: " + str(matched_prob) + "%")
+        lines.append(f"Polymarket YES: {polymarket_pct}%")
+        lines.append(f"Vegas implied: {matched_prob}%")
         if gap > 10:
-            lines.append("Gap: +" + str(gap) + "% - AGREE underpriced vs Vegas")
+            lines.append(f"Gap: +{gap}% — AGREE underpriced vs Vegas")
         elif gap < -10:
-            lines.append("Gap: " + str(gap) + "% - DISAGREE overpriced vs Vegas")
+            lines.append(f"Gap: {gap}% — DISAGREE overpriced vs Vegas")
         else:
-            lines.append("Gap: " + str(gap) + "% - fair price, INVESTIGATE")
+            lines.append(f"Gap: {gap}% — fair price, INVESTIGATE")
+    else:
+        lines.append("Could not match a team from the question to Vegas odds")
     return "\n".join(lines)
 
 async def build_research_summary(question, yes_price, category, fear_greed, odds_api_key):

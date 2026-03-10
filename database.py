@@ -153,7 +153,12 @@ async def init_db(conn):
             resolution_price FLOAT,
             loss_reason TEXT,
             volume_at_resolution FLOAT,
-            actual_hold_days FLOAT
+            actual_hold_days FLOAT,
+            direction TEXT,
+            edge_pct FLOAT,
+            vegas_gap FLOAT,
+            vegas_implied FLOAT,
+            spread FLOAT
         )
     """)
 
@@ -425,9 +430,11 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
                            days_to_resolution, price_7d_ago, price_3d_ago, price_1d_ago,
                            score_breakdown, bid_price, ask_price,
                            alerts_in_last_24h, active_open_positions_count,
-                           market_type, price_pct_of_range, hour_of_day_utc)
+                           market_type, price_pct_of_range, hour_of_day_utc,
+                           direction, edge_pct, vegas_gap, vegas_implied, spread)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
+                $29,$30,$31,$32,$33)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -448,7 +455,12 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         open_positions,
         opportunity.get("market_type"),
         opportunity.get("price_pct_of_range"),
-        now().hour
+        now().hour,
+        opportunity.get("direction"),
+        opportunity.get("edge_pct"),
+        opportunity.get("vegas_gap"),
+        opportunity.get("vegas_implied"),
+        opportunity.get("spread"),
     )
 
     await conn.execute("""
