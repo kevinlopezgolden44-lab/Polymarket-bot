@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import os
+import re
 import json
 from datetime import datetime, timedelta
 import asyncpg
@@ -15,7 +16,10 @@ from database import (
     record_alert_snapshot, cleanup_old_snapshots
 )
 from scoring import score_opportunity, is_market_active, detect_category, detect_market_type
-from research import get_fear_greed, build_research_summary, get_crypto_data, prefetch_all_crypto
+from research import (
+    get_fear_greed, build_research_summary, get_crypto_data,
+    prefetch_all_crypto, get_sports_odds
+)
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
     analyze_liquidity, check_cross_market_consistency,
@@ -37,6 +41,9 @@ CONFIG = {
     "heartbeat_hour_utc": 12,
     "resolution_check_hours": [6, 8, 10, 12, 14, 16, 18, 20, 22],
     "weekly_analysis_day": 6,
+    # Connection pool settings
+    "pool_min_size": 2,
+    "pool_max_size": 10,
 }
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -51,8 +58,37 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Filters defined once at module level — not inside the hot loop
+ESPORTS_KEYWORDS = [
+    "counter-strike", "cs2", "valorant", "dota", "league of legends",
+    "lol:", "bo3", "bo5", "esport", "gaming league", "blast",
+    "esl", "faceit", "dreamhack", "iem ", "majors:"
+]
+WEATHER_KEYWORDS = [
+    "temperature", "rainfall", "precipitation", "hurricane",
+    "tornado", "snowfall", "weather", "degrees", "fahrenheit",
+    "celsius", "highest temp", "lowest temp", "wind speed"
+]
+TENNIS_KEYWORDS = [
+    "atp ", "wta ", "open tennis", "wimbledon",
+    "french open", "us open tennis", "roland garros"
+]
+SHORT_WINDOW_KEYWORDS = ["up or down", "pump or dump", "higher or lower", "above or below"]
+FUTURES_KEYWORDS = [
+    "win the nba finals", "win the nba championship",
+    "win the super bowl", "win the world series",
+    "win the stanley cup", "win the champions league",
+    "win the world cup", "nba champion", "nfl champion",
+    "2025 champion", "2026 champion", "2027 champion",
+    "win it all", "go all the way",
+]
+FUTURES_PATTERN = re.compile(
+    r'win the \d{4} (nba|nfl|mlb|nhl|champions league|world cup|super bowl)'
+)
+
 def now():
     return datetime.utcnow()
+
 
 async def fetch_all_markets():
     all_markets = []
@@ -93,6 +129,7 @@ async def fetch_all_markets():
                 break
     return all_markets
 
+
 async def load_upcoming_events(conn):
     try:
         rows = await conn.fetch("""
@@ -106,8 +143,8 @@ async def load_upcoming_events(conn):
         log.warning("load_upcoming_events error: %s", e)
         return []
 
+
 async def seed_event_calendar(conn):
-    """Seed known upcoming events into the calendar."""
     events = [
         ("FOMC Meeting", "2026-03-18 18:00:00", "Economics", "fed,federal reserve,interest rate,fomc,rate decision"),
         ("NBA Playoffs Start", "2026-04-15 00:00:00", "Sports", "nba,playoffs,basketball"),
@@ -128,7 +165,8 @@ async def seed_event_calendar(conn):
             """, name, datetime.fromisoformat(date_str), category, keywords, now())
     log.info("Event calendar seeded")
 
-async def process_updates(conn, updates, last_update_id):
+
+async def process_updates(pool, updates, last_update_id):
     new_last_id = last_update_id
     for update in updates:
         update_id = update.get("update_id", 0)
@@ -141,7 +179,8 @@ async def process_updates(conn, updates, last_update_id):
             text = message.get("text", "")
             if text and "/status" in text.lower():
                 log.info("Status command received")
-                await send_status(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
+                async with pool.acquire() as conn:
+                    await send_status(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
 
         callback = update.get("callback_query")
         if callback:
@@ -152,10 +191,11 @@ async def process_updates(conn, updates, last_update_id):
                 parts = data.split("_")
                 rating = parts[0]
                 alert_id = parts[1]
-                await conn.execute(
-                    "UPDATE alerts SET user_rating=$1 WHERE id=$2",
-                    rating, int(alert_id)
-                )
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE alerts SET user_rating=$1 WHERE id=$2",
+                        rating, int(alert_id)
+                    )
                 emoji = "👍" if rating == "agree" else "👎"
                 await send_message(
                     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -164,52 +204,65 @@ async def process_updates(conn, updates, last_update_id):
                 )
     return new_last_id
 
+
+def _should_skip_market(question_lower):
+    """Returns True if this market should be filtered out before scoring."""
+    if any(kw in question_lower for kw in ESPORTS_KEYWORDS):
+        return True
+    if any(kw in question_lower for kw in WEATHER_KEYWORDS):
+        return True
+    if any(kw in question_lower for kw in TENNIS_KEYWORDS):
+        return True
+    if any(kw in question_lower for kw in SHORT_WINDOW_KEYWORDS):
+        return True
+    if any(kw in question_lower for kw in FUTURES_KEYWORDS):
+        return True
+    if FUTURES_PATTERN.search(question_lower):
+        return True
+    return False
+
+
 async def main():
     log.info("=" * 50)
-    log.info("Polymarket Bot v15 Starting...")
-    log.info("Multi-file architecture")
-    log.info("Fixed: profitability logic")
-    log.info("Fixed: category double-tagging")
-    log.info("Fixed: loss streak reset")
-    log.info("New: price momentum detection")
-    log.info("New: price velocity alerts")
-    log.info("New: liquidity depth checking")
-    log.info("New: cross-market consistency")
-    log.info("New: polymarket lag detection")
-    log.info("New: event timing awareness")
-    log.info("New: resolution ambiguity detection")
-    log.info("New: Economics and Science categories")
-    log.info("New: confidence tiers HIGH/MEDIUM/LOW")
+    log.info("Polymarket Bot v16 Starting...")
+    log.info("Change: Connection pooling (asyncpg.create_pool)")
+    log.info("Change: Vegas gap now wired into score_opportunity")
     log.info("=" * 50)
 
-    conn = await asyncpg.connect(DATABASE_URL)
-    await init_db(conn)
-    await seed_event_calendar(conn)
-    await reset_loss_streak(conn)
+    # ── CONNECTION POOL ────────────────────────────────────────────────────────
+    # Creates a pool of 2–10 persistent connections.
+    # If a connection drops (Railway timeout etc), the pool auto-reconnects.
+    # All DB calls acquire a connection, use it, then return it to the pool.
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=CONFIG["pool_min_size"],
+        max_size=CONFIG["pool_max_size"],
+        command_timeout=30,         # per-query timeout
+        max_inactive_connection_lifetime=300,  # recycle idle connections every 5 min
+    )
+    log.info("Connection pool ready (min=%d max=%d)",
+             CONFIG["pool_min_size"], CONFIG["pool_max_size"])
+
+    async with pool.acquire() as conn:
+        await init_db(conn)
+        await seed_event_calendar(conn)
+        await reset_loss_streak(conn)
 
     await send_message(
         TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-        "<b>Polymarket Bot v15 Started!</b>\n\n"
-        "Multi-file professional architecture\n\n"
-        "Fixed:\n"
-        "Profitability logic corrected\n"
-        "Category double-tagging fixed\n"
-        "False loss streak reset\n\n"
-        "New:\n"
-        "Price momentum detection\n"
-        "Price velocity alerts\n"
-        "Liquidity depth checking\n"
-        "Cross-market consistency\n"
-        "Polymarket lag detection\n"
-        "Event timing awareness\n"
-        "Resolution ambiguity warnings\n"
-        "Economics and Science categories\n"
-        "Confidence tiers HIGH MEDIUM LOW\n\n"
+        "<b>Polymarket Bot v16 Started!</b>\n\n"
+        "Changes in this version:\n"
+        "Connection pooling — bot survives DB reconnects\n"
+        "Vegas gap now scores markets (not just shown in alerts)\n\n"
         "Type /status to check stats!"
     )
 
-    alerted_markets = await get_alerted_markets(conn)
-    logged_opportunities = await get_logged_opportunities(conn)
+    alerted_markets = set()
+    logged_opportunities = set()
+    async with pool.acquire() as conn:
+        alerted_markets = await get_alerted_markets(conn)
+        logged_opportunities = await get_logged_opportunities(conn)
+
     last_summary_date = None
     last_heartbeat_date = None
     last_weekly_date = None
@@ -222,49 +275,54 @@ async def main():
         try:
             current_time = now()
 
-            # Process Telegram updates
+            # ── Telegram updates ───────────────────────────────────────────────
             updates = await get_updates(TELEGRAM_TOKEN, last_update_id + 1)
             if updates:
-                last_update_id = await process_updates(conn, updates, last_update_id)
+                last_update_id = await process_updates(pool, updates, last_update_id)
 
-            # Refresh Fear and Greed every hour
+            # ── Fear & Greed (refresh hourly) ──────────────────────────────────
             if (fear_greed_cache["cached_at"] is None or
                     (now() - fear_greed_cache["cached_at"]).total_seconds() > 3600):
                 fear_greed = await get_fear_greed()
                 fear_greed_cache["data"] = fear_greed
                 fear_greed_cache["cached_at"] = now()
                 if fear_greed.get("success"):
-                    await log_sentiment(conn, fear_greed)
+                    async with pool.acquire() as conn:
+                        await log_sentiment(conn, fear_greed)
                     log.info("Fear and Greed: %d (%s) %s",
                              fear_greed["score"], fear_greed["regime"],
                              fear_greed.get("trend", ""))
             else:
                 fear_greed = fear_greed_cache["data"]
 
-            # Scheduled tasks
+            # ── Scheduled tasks ────────────────────────────────────────────────
             if (current_time.hour == CONFIG["heartbeat_hour_utc"] and
                     current_time.date() != last_heartbeat_date):
-                await send_heartbeat(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
+                async with pool.acquire() as conn:
+                    await send_heartbeat(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
                 last_heartbeat_date = current_time.date()
 
             if (current_time.hour == CONFIG["summary_hour_utc"] and
                     current_time.date() != last_summary_date):
-                await send_daily_summary(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
+                async with pool.acquire() as conn:
+                    await send_daily_summary(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
                 last_summary_date = current_time.date()
 
             if (current_time.weekday() == CONFIG["weekly_analysis_day"] and
                     current_time.date() != last_weekly_date):
-                await send_weekly_analysis(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
-                backtest_report = await run_weekly_backtest(conn)
-                await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, backtest_report)
-                await cleanup_old_snapshots(conn)
+                async with pool.acquire() as conn:
+                    await send_weekly_analysis(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, conn)
+                    backtest_report = await run_weekly_backtest(conn)
+                    await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, backtest_report)
+                    await cleanup_old_snapshots(conn)
                 last_weekly_date = current_time.date()
 
             resolution_key = str(current_time.date()) + "_" + str(current_time.hour)
             if (current_time.hour in CONFIG["resolution_check_hours"] and
                     resolution_key not in last_resolution_hours):
                 log.info("Running resolution check...")
-                resolved_count = await check_resolutions(conn)
+                async with pool.acquire() as conn:
+                    resolved_count = await check_resolutions(conn)
                 last_resolution_hours.add(resolution_key)
                 if len(last_resolution_hours) > 100:
                     last_resolution_hours = set(list(last_resolution_hours)[-50:])
@@ -276,8 +334,8 @@ async def main():
                         "Type /status to see updated win rate!"
                     )
 
-            # Monitor open positions for take-profit / stop-loss
-            closed_positions = await update_open_positions(conn)
+            # ── Monitor open positions (pool passed — each position gets own conn)
+            closed_positions = await update_open_positions(pool)
             for pos in closed_positions:
                 emoji = "✅" if pos["profitable"] else "❌"
                 direction = "+" if pos["return_pct"] >= 0 else ""
@@ -292,12 +350,11 @@ async def main():
                 )
                 await send_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
 
-            # Load upcoming events for this scan
-            upcoming_events = await load_upcoming_events(conn)
-
-            # Main market scan
-            # Pre-fetch all coin prices in one request before scanning
+            # ── Pre-fetch data before scan ─────────────────────────────────────
             await prefetch_all_crypto()
+
+            async with pool.acquire() as conn:
+                upcoming_events = await load_upcoming_events(conn)
 
             log.info("Scanning Polymarket markets...")
             markets = await fetch_all_markets()
@@ -319,7 +376,8 @@ async def main():
                 log.info("%d total -> %d active after filtering",
                          len(markets), len(active_markets))
 
-                state = await get_risk_state(conn)
+                async with pool.acquire() as conn:
+                    state = await get_risk_state(conn)
                 limits = get_dynamic_limits(state)
 
                 opportunities = []
@@ -327,40 +385,11 @@ async def main():
                 for market in active_markets:
                     question_lower = market.get("question", "").lower()
 
-                    # Skip low-edge categories
-                    esports_keywords = [
-                        "counter-strike", "cs2", "valorant", "dota", "league of legends",
-                        "lol:", "bo3", "bo5", "esport", "gaming league", "blast",
-                        "esl", "faceit", "dreamhack", "iem ", "majors:"
-                    ]
-                    weather_keywords = [
-                        "temperature", "rainfall", "precipitation", "hurricane",
-                        "tornado", "snowfall", "weather", "degrees", "fahrenheit",
-                        "celsius", "highest temp", "lowest temp", "wind speed"
-                    ]
-                    tennis_keywords = [
-                        "atp ", "wta ", "open tennis", "wimbledon",
-                        "french open", "us open tennis", "roland garros"
-                    ]
-
-                    if any(kw in question_lower for kw in esports_keywords):
-                        continue
-                    if any(kw in question_lower for kw in weather_keywords):
-                        continue
-                    if any(kw in question_lower for kw in tennis_keywords):
+                    # ── Pre-score filters ──────────────────────────────────────
+                    if _should_skip_market(question_lower):
                         continue
 
-                    # Short-window binaries — pure noise, no signal applies
-                    # "Bitcoin Up or Down - March 9, 3:45AM-4:00AM ET" style markets
-                    short_window_keywords = [
-                        "up or down", "pump or dump",
-                        "higher or lower", "above or below",
-                    ]
-                    if any(kw in question_lower for kw in short_window_keywords):
-                        continue
-
-                    # Coin-flip filter: YES price near 50c AND resolves in under 4 hours
-                    # These have no tradeable edge regardless of other signals
+                    # Coin-flip filter: near-50 price AND resolves in under 4 hours
                     try:
                         _outcomes_chk = market.get("outcomePrices", "[0.5]")
                         if isinstance(_outcomes_chk, str):
@@ -377,14 +406,11 @@ async def main():
                     except Exception:
                         pass
 
-                    # Minimum volume filter — $1,000 24h volume required
-                    # Too thin to trade meaningfully at $5/position
+                    # Minimum volume filter
                     if float(market.get("volume24hr", 0) or 0) < 1000:
                         continue
 
-                    # Minimum YES price filter — skip near-zero and near-certain markets
-                    # Below 2¢ or above 98¢: market has decided, position math breaks down,
-                    # and any Vegas gap comparison becomes meaningless noise
+                    # YES price bounds filter
                     try:
                         _outcomes_price = market.get("outcomePrices", "[0.5]")
                         if isinstance(_outcomes_price, str):
@@ -395,44 +421,35 @@ async def main():
                     except Exception:
                         pass
 
-                    # Futures market filter — skip season-long championship markets
-                    # Vegas h2h game odds don't apply to "Will X win the Finals/Super Bowl/etc"
-                    # These require futures odds which the Odds API h2h endpoint doesn't provide
-                    futures_keywords = [
-                        "win the nba finals", "win the nba championship",
-                        "win the super bowl", "win the world series",
-                        "win the stanley cup", "win the champions league",
-                        "win the world cup", "nba champion", "nfl champion",
-                        "2025 champion", "2026 champion", "2027 champion",
-                        "win it all", "go all the way",
-                    ]
-                    _is_futures = any(kw in question_lower for kw in futures_keywords)
-                    # Also catch "win the 2026 NBA Finals" (year injected between "the" and league)
-                    if not _is_futures:
-                        import re as _re
-                        _is_futures = bool(_re.search(
-                            r'win the \d{4} (nba|nfl|mlb|nhl|champions league|world cup|super bowl)',
-                            question_lower
-                        ))
-                    if _is_futures:
-                        continue
-
-                    # Fetch price history before scoring so momentum/velocity signals
-                    # can influence the score even on first evaluation
+                    # ── Pre-fetch price history ────────────────────────────────
                     _market_id_pre = str(market.get("id", ""))
                     _history_pre = []
                     if _market_id_pre:
                         try:
-                            _history_pre = await get_price_history(conn, _market_id_pre)
+                            async with pool.acquire() as conn:
+                                _history_pre = await get_price_history(conn, _market_id_pre)
                         except Exception:
                             pass
+
+                    # ── FIX: Fetch sports odds BEFORE scoring so Vegas gap
+                    #         contributes to the score, not just the alert message
+                    category = detect_category(market.get("question", ""))
+                    sports_odds = None
+                    if category == "Sports" and ODDS_API_KEY:
+                        try:
+                            sports_odds = await get_sports_odds(
+                                market.get("question", ""), ODDS_API_KEY
+                            )
+                        except Exception as e:
+                            log.warning("Sports odds prefetch error: %s", e)
 
                     result = score_opportunity(
                         market,
                         price_history_rows=_history_pre,
                         all_markets=active_markets,
                         upcoming_events=upcoming_events,
-                        fear_greed=fear_greed
+                        fear_greed=fear_greed,
+                        sports_odds=sports_odds,   # ← NOW PASSED IN AT SCORE TIME
                     )
                     score = result["score"]
                     reason = result["reason"]
@@ -450,13 +467,11 @@ async def main():
                     market_id = str(market.get("id", question[:50]))
                     volume = float(market.get("volumeNum", 0) or 0)
 
-                    # ── Rich context data collection ──────────────────────
-                    # Days to resolution
+                    # ── Days to resolution ─────────────────────────────────────
                     days_to_resolution = None
                     end_date_raw = market.get("endDate") or market.get("end_date")
                     if end_date_raw:
                         try:
-                            from datetime import timezone
                             end_dt = datetime.fromisoformat(
                                 str(end_date_raw).replace("Z", "+00:00")
                             ).replace(tzinfo=None)
@@ -466,42 +481,41 @@ async def main():
                         except Exception:
                             pass
 
-                    # Bid/ask spread from market data
                     bid_price = float(market.get("bestBid", 0) or 0) or None
                     ask_price = float(market.get("bestAsk", 0) or 0) or None
 
-                    # Score breakdown for backtest analysis
                     score_breakdown = {
                         "base": 50,
-                        "liquidity": result["signals"].get("liquidity", {}).get("liquid", True) and 5 or -20,
+                        "liquidity": 5 if result["signals"].get("liquidity", {}).get("liquid", True) else -20,
                         "momentum": result["signals"].get("momentum", {}).get("signal", "STABLE"),
                         "velocity": result["signals"].get("velocity", {}).get("fast_move", False),
                         "ambiguity": bool(result["signals"].get("ambiguity")),
                         "lag": bool(result["signals"].get("lag")),
                         "age_hours": market_age,
+                        "vegas_gap": result["signals"].get("vegas_gap"),
                         "final_score": score,
                     }
 
-                    # Market type (sub-category for strategy analysis)
                     market_type = result.get("market_type", "GENERAL")
 
-                    # Price position in 30-day range (where is entry vs historical range)
+                    # ── 30-day price range ────────────────────────────────────
                     price_pct_of_range = None
-                    history_30d = await conn.fetch("""
-                        SELECT yes_price FROM price_history
-                        WHERE market_id=$1
-                        AND recorded_at > NOW() - INTERVAL '30 days'
-                    """, market_id)
+                    async with pool.acquire() as conn:
+                        history_30d = await conn.fetch("""
+                            SELECT yes_price FROM price_history
+                            WHERE market_id=$1
+                            AND recorded_at > NOW() - INTERVAL '30 days'
+                        """, market_id)
                     if history_30d and len(history_30d) >= 3:
                         prices_30d = [float(r["yes_price"]) for r in history_30d]
                         lo, hi = min(prices_30d), max(prices_30d)
                         if hi > lo:
                             price_pct_of_range = round((yes_price - lo) / (hi - lo) * 100, 1)
 
-                    # Revisit count — how many times has this market been seen before
-                    revisit_count = await conn.fetchval(
-                        "SELECT COUNT(*) FROM alerts WHERE market_id=$1", market_id
-                    )
+                    async with pool.acquire() as conn:
+                        revisit_count = await conn.fetchval(
+                            "SELECT COUNT(*) FROM alerts WHERE market_id=$1", market_id
+                        )
 
                     opp = {
                         "id": market_id,
@@ -512,39 +526,45 @@ async def main():
                         "volume": volume,
                         "age": market_age,
                         "category": category,
-                        "confidence_tier": "LOW",  # placeholder; overwritten by calculate_confidence_tier below
+                        "confidence_tier": "LOW",
                         "days_to_resolution": days_to_resolution,
                         "bid_price": bid_price,
                         "ask_price": ask_price,
                         "score_breakdown": score_breakdown,
                         "market_type": market_type,
                         "price_pct_of_range": price_pct_of_range,
+                        # Expose Vegas gap in opp for alert display
+                        "vegas_gap": result["signals"].get("vegas_gap"),
+                        "vegas_implied": result["signals"].get("vegas_implied"),
+                        "direction": result.get("direction", "NO_EDGE"),
+                        "edge_pct": result.get("edge_pct"),
                     }
 
-                    # Run analysis modules
-                    liquidity = analyze_liquidity(market)
+                    # ── Analysis modules (using scoring results — no re-computation)
+                    liquidity = result["signals"]["liquidity"]
                     if not liquidity["liquid"]:
                         opp["liquidity_warning"] = liquidity["warning"]
 
-                    ambiguity = check_resolution_ambiguity(question)
+                    ambiguity = result["signals"]["ambiguity"]
                     if ambiguity:
                         opp["ambiguity_warning"] = ambiguity
 
-                    event_matches = analyze_event_timing(market, upcoming_events)
+                    event_matches = result["signals"]["matched_events"]
                     if event_matches:
                         opp["upcoming_events"] = event_matches
 
-                    inconsistencies = check_cross_market_consistency(market, active_markets)
+                    inconsistencies = result["signals"]["inconsistencies"]
                     if inconsistencies:
                         opp["inconsistencies"] = inconsistencies
 
-                    # Price history based analysis
+                    # ── Price history analysis ─────────────────────────────────
                     confirming = 0
                     contradicting = 0
 
                     if market_id in alerted_markets:
-                        await update_price_history(conn, market_id, yes_price)
-                        history = await get_price_history(conn, market_id)
+                        async with pool.acquire() as conn:
+                            await update_price_history(conn, market_id, yes_price)
+                            history = await get_price_history(conn, market_id)
 
                         if history:
                             momentum = analyze_price_momentum(history)
@@ -559,7 +579,6 @@ async def main():
                                 opp["velocity_alert"] = velocity["alert"]
                                 confirming += 1
 
-                            # Extract price context: what was price 1d/3d/7d ago
                             try:
                                 now_ts = now()
                                 def price_n_days_ago(h, days):
@@ -572,20 +591,20 @@ async def main():
                             except Exception:
                                 pass
 
-                        # Record dense snapshot for post-alert price curve
-                        alert_row = await conn.fetchrow(
-                            "SELECT id, alerted_at FROM alerts WHERE market_id=$1 ORDER BY alerted_at DESC LIMIT 1",
-                            market_id
-                        )
-                        if alert_row:
-                            await record_alert_snapshot(
-                                conn, alert_row["id"], market_id, yes_price,
-                                alert_row["alerted_at"],
-                                bid_price=opp.get("bid_price"),
-                                ask_price=opp.get("ask_price")
+                        async with pool.acquire() as conn:
+                            alert_row = await conn.fetchrow(
+                                "SELECT id, alerted_at FROM alerts WHERE market_id=$1 ORDER BY alerted_at DESC LIMIT 1",
+                                market_id
                             )
+                            if alert_row:
+                                await record_alert_snapshot(
+                                    conn, alert_row["id"], market_id, yes_price,
+                                    alert_row["alerted_at"],
+                                    bid_price=opp.get("bid_price"),
+                                    ask_price=opp.get("ask_price")
+                                )
 
-                    # Polymarket lag detection for crypto
+                    # ── Polymarket lag detection (Crypto) ──────────────────────
                     if category == "Crypto":
                         crypto_data = await get_crypto_data(question)
                         lag = detect_polymarket_lag(question, yes_price, crypto_data)
@@ -593,12 +612,16 @@ async def main():
                             opp["lag_detected"] = lag
                             confirming += 2
 
-                    # Calculate confidence tier
+                    # Vegas gap confirming signals (already scored — just count for tier)
+                    vegas_gap = result["signals"].get("vegas_gap")
+                    if vegas_gap is not None and abs(vegas_gap) > 10:
+                        confirming += 2 if abs(vegas_gap) > 15 else 1
+
                     opp["confidence_tier"] = calculate_confidence_tier(
                         score, confirming, contradicting
                     )
 
-                    # Build signals_fired string for backtest tracking
+                    # ── Signals fired string ───────────────────────────────────
                     fired = []
                     if opp.get("momentum", {}).get("signal") in ["RISING", "STRONG_RISING"]:
                         fired.append("momentum_up")
@@ -616,14 +639,16 @@ async def main():
                         fired.append("low_liquidity")
                     if opp.get("ambiguity_warning"):
                         fired.append("ambiguous")
+                    if vegas_gap is not None and abs(vegas_gap) > 10:
+                        fired.append("vegas_gap")
                     opp["signals_fired"] = ",".join(fired)
 
-                    # Log all 40+ opportunities silently
+                    # ── Log opportunity (silent, 40+) ──────────────────────────
                     if market_id not in logged_opportunities:
-                        await log_opportunity(conn, opp, fear_greed, market_age)
+                        async with pool.acquire() as conn:
+                            await log_opportunity(conn, opp, fear_greed, market_age)
                         logged_opportunities.add(market_id)
 
-                    # Only alert on 70+
                     if score >= CONFIG["min_score_for_alert"]:
                         opportunities.append(opp)
 
@@ -635,12 +660,16 @@ async def main():
                         log.info("Score:%d [%s] %s",
                                  opp["score"], opp["category"], opp["question"][:60])
                         if opp["id"] not in alerted_markets:
-                            # First time seeing this market — log it and send alert
-                            alert_id = await log_alert(
-                                conn, opp, fear_greed, opp.get("age")
-                            )
+                            async with pool.acquire() as conn:
+                                alert_id = await log_alert(
+                                    conn, opp, fear_greed, opp.get("age")
+                                )
                             alerted_markets.add(opp["id"])
 
+                            # Research summary for alert message
+                            # Sports odds already fetched for scoring — reuse via
+                            # build_research_summary which fetches internally.
+                            # For crypto the cache is already warm from prefetch.
                             research = await build_research_summary(
                                 opp["question"], opp["yes_price"],
                                 opp["category"], fear_greed, ODDS_API_KEY
@@ -651,15 +680,14 @@ async def main():
                                 opp, alert_id, research, limits
                             )
                         else:
-                            # Market seen again — increment revisit counter only, no re-alert
-                            await conn.execute("""
-                                UPDATE alerts SET revisit_count = COALESCE(revisit_count, 0) + 1
-                                WHERE market_id=$1 AND id=(
-                                    SELECT id FROM alerts WHERE market_id=$1
-                                    ORDER BY alerted_at DESC LIMIT 1
-                                )
-                            """, opp["id"])
-
+                            async with pool.acquire() as conn:
+                                await conn.execute("""
+                                    UPDATE alerts SET revisit_count = COALESCE(revisit_count, 0) + 1
+                                    WHERE market_id=$1 AND id=(
+                                        SELECT id FROM alerts WHERE market_id=$1
+                                        ORDER BY alerted_at DESC LIMIT 1
+                                    )
+                                """, opp["id"])
                 else:
                     log.info("No new alertable opportunities this scan")
 
@@ -675,6 +703,7 @@ async def main():
         log.info("Next scan in %d seconds", CONFIG["check_interval_seconds"])
         log.info("-" * 50)
         await asyncio.sleep(CONFIG["check_interval_seconds"])
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -9,21 +9,28 @@ def now():
     return datetime.utcnow()
 
 
+# ── CONNECTION POOL HELPER ─────────────────────────────────────────────────────
+# All functions accept either a pool or a direct connection.
+# If passed a pool, they acquire a connection for the duration of the call.
+# This makes every function safe to call from both contexts.
+
+async def _acquire(conn_or_pool):
+    """Returns (conn, should_release) tuple."""
+    if isinstance(conn_or_pool, asyncpg.pool.Pool):
+        conn = await conn_or_pool.acquire()
+        return conn, True
+    return conn_or_pool, False
+
+async def _release(pool, conn, should_release):
+    if should_release:
+        await pool.release(conn)
+
+
 async def backfill_outcome_types(conn):
     """
     One-time migration for resolved alerts that predate the outcome_type
     and return tracking columns. Safe to run on every startup — it only
     touches rows where outcome_type IS NULL and outcome IS NOT NULL.
-
-    Derives:
-      entry_price      — from yes_price (the price at alert time)
-      exit_price       — from outcomePrices via Polymarket API (YES=0.99, NO=0.01)
-      exit_return_pct  — (exit - entry) / entry * 100
-      peak_price       — best estimate: exit_price if win, entry_price if loss
-                         (true peak requires price history; this is a safe approximation)
-      peak_return_pct  — same basis as above
-      outcome_type     — FULL_WIN / LOSS derived from outcome + entry_price
-      exit_reason      — RESOLVED (all backfilled trades were held to resolution)
     """
     rows = await conn.fetch("""
         SELECT id, yes_price, outcome, profitable
@@ -39,10 +46,9 @@ async def backfill_outcome_types(conn):
         for row in rows:
             try:
                 entry = float(row["yes_price"])
-                outcome = row["outcome"]          # "YES", "NO", or "PARTIAL"
+                outcome = row["outcome"]
                 profitable = row["profitable"]
 
-                # Derive exit price from outcome
                 if outcome == "YES":
                     exit_price = 0.99
                 elif outcome == "NO":
@@ -50,7 +56,6 @@ async def backfill_outcome_types(conn):
                 else:
                     exit_price = entry
 
-                # Derive outcome_type
                 if outcome == "YES":
                     outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
                 elif outcome == "NO":
@@ -58,7 +63,6 @@ async def backfill_outcome_types(conn):
                 else:
                     outcome_type = "PARTIAL_WIN" if profitable else "LOSS"
 
-                # Calculate returns
                 if entry and entry > 0:
                     exit_return_pct = round((exit_price - entry) / entry * 100, 2)
                 else:
@@ -90,8 +94,6 @@ async def backfill_outcome_types(conn):
     else:
         log.info("Backfill: nothing to migrate")
 
-    # Second pass always runs — marks all pre-upgrade alerts as backfilled.
-    # Runs regardless of whether the first pass found anything to migrate.
     UPGRADE_DATE = "2026-03-06"
     await conn.execute(f"""
         UPDATE alerts
@@ -122,7 +124,6 @@ async def init_db(conn):
             score_components TEXT,
             confidence_tier TEXT,
             category TEXT,
-            -- Enhanced outcome tracking
             outcome_type TEXT,
             entry_price FLOAT,
             peak_price FLOAT,
@@ -131,7 +132,6 @@ async def init_db(conn):
             exit_return_pct FLOAT,
             exit_reason TEXT,
             signals_fired TEXT,
-            -- Rich data collection for backtest & CLOB strategy development
             days_to_resolution FLOAT,
             price_7d_ago FLOAT,
             price_3d_ago FLOAT,
@@ -144,14 +144,12 @@ async def init_db(conn):
             peak_reached_at TIMESTAMP,
             first_profitable_at TIMESTAMP,
             last_profitable_at TIMESTAMP,
-            -- Strategy development columns
             market_type TEXT,
             price_pct_of_range FLOAT,
             hold_duration_hours FLOAT,
             hour_of_day_utc INTEGER,
             loss_pattern TEXT,
             revisit_count INTEGER DEFAULT 0,
-            -- Diagnostic columns
             resolution_price FLOAT,
             loss_reason TEXT,
             volume_at_resolution FLOAT,
@@ -159,7 +157,6 @@ async def init_db(conn):
         )
     """)
 
-    # Trade position tracking - monitors open alerts for take-profit / stop-loss
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_positions (
             id SERIAL PRIMARY KEY,
@@ -178,7 +175,6 @@ async def init_db(conn):
         )
     """)
 
-    # Paper trading simulation — resets daily, $200 starting bankroll
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS sim_trades (
             id SERIAL PRIMARY KEY,
@@ -200,6 +196,7 @@ async def init_db(conn):
             is_open BOOLEAN DEFAULT TRUE
         )
     """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS sim_daily_log (
             id SERIAL PRIMARY KEY,
@@ -217,7 +214,6 @@ async def init_db(conn):
         )
     """)
 
-    # Dense price tracking for 48h after each alert — reveals optimal exit windows
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS alert_price_snapshots (
             id SERIAL PRIMARY KEY,
@@ -249,6 +245,7 @@ async def init_db(conn):
             category TEXT
         )
     """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS price_history (
             id SERIAL PRIMARY KEY,
@@ -257,6 +254,7 @@ async def init_db(conn):
             recorded_at TIMESTAMP NOT NULL
         )
     """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS sentiment_history (
             id SERIAL PRIMARY KEY,
@@ -267,6 +265,7 @@ async def init_db(conn):
             recorded_at TIMESTAMP NOT NULL
         )
     """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS risk_log (
             id SERIAL PRIMARY KEY,
@@ -278,6 +277,7 @@ async def init_db(conn):
             trade_size_multiplier FLOAT DEFAULT 1.0
         )
     """)
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS event_calendar (
             id SERIAL PRIMARY KEY,
@@ -289,7 +289,7 @@ async def init_db(conn):
         )
     """)
 
-    # Safe column additions for existing tables
+    # Safe column additions
     for col, typedef in [
         ("user_rating", "TEXT"),
         ("fear_greed_score", "INTEGER"),
@@ -298,7 +298,6 @@ async def init_db(conn):
         ("score_components", "TEXT"),
         ("confidence_tier", "TEXT"),
         ("category", "TEXT"),
-        # Enhanced outcome tracking columns
         ("outcome_type", "TEXT"),
         ("entry_price", "FLOAT"),
         ("peak_price", "FLOAT"),
@@ -339,15 +338,13 @@ async def init_db(conn):
     await conn.execute("ALTER TABLE sentiment_history ADD COLUMN IF NOT EXISTS trend TEXT")
 
     log.info("Database tables ready")
-
-    # Backfill any resolved trades missing outcome_type / return data
     await backfill_outcome_types(conn)
+
 
 async def get_risk_state(conn):
     today = now().strftime("%Y-%m-%d")
     row = await conn.fetchrow("SELECT * FROM risk_log WHERE date = $1", today)
     if not row:
-        # Carry over streaks from yesterday
         yesterday = await conn.fetchrow("""
             SELECT win_streak, loss_streak, trade_size_multiplier
             FROM risk_log ORDER BY date DESC LIMIT 1
@@ -362,6 +359,7 @@ async def get_risk_state(conn):
         row = await conn.fetchrow("SELECT * FROM risk_log WHERE date = $1", today)
     return dict(row)
 
+
 async def reset_loss_streak(conn):
     today = now().strftime("%Y-%m-%d")
     await conn.execute("""
@@ -369,6 +367,7 @@ async def reset_loss_streak(conn):
         WHERE date = $1
     """, today)
     log.info("Loss streak reset to 0")
+
 
 async def update_risk_state(conn, profitable):
     today = now().strftime("%Y-%m-%d")
@@ -386,6 +385,7 @@ async def update_risk_state(conn, profitable):
         WHERE date=$4
     """, new_win, new_loss, multiplier, today)
 
+
 def get_dynamic_limits(state):
     multiplier = state.get("trade_size_multiplier", 1.0)
     return {
@@ -394,13 +394,13 @@ def get_dynamic_limits(state):
         "max_open_positions": 10
     }
 
+
 async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
     fg_score = fear_greed.get("score") if fear_greed else None
     fg_regime = fear_greed.get("regime") if fear_greed else None
     entry_price = opportunity["yes_price"]
     signals_fired = opportunity.get("signals_fired", "")
 
-    # Count context metrics
     alerts_24h = await conn.fetchval("""
         SELECT COUNT(*) FROM alerts
         WHERE alerted_at > NOW() - INTERVAL '24 hours'
@@ -450,15 +450,17 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         opportunity.get("price_pct_of_range"),
         now().hour
     )
-    # Open a trade position for this alert so we can monitor it
+
     await conn.execute("""
         INSERT INTO trade_positions (alert_id, market_id, entry_price, peak_price,
                                      current_price, opened_at)
         VALUES ($1, $2, $3, $4, $5, $6)
     """, alert_id, opportunity["id"], entry_price, entry_price, entry_price, now())
+
     count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
     log.info("Alert logged (total: %d)", count)
     return alert_id
+
 
 async def log_opportunity(conn, opportunity, fear_greed=None, market_age=None):
     existing = await conn.fetchrow(
@@ -479,6 +481,7 @@ async def log_opportunity(conn, opportunity, fear_greed=None, market_age=None):
         fg_score, fg_regime, market_age, opportunity.get("category", "General")
     )
 
+
 async def update_price_history(conn, market_id, yes_price):
     last = await conn.fetchrow("""
         SELECT recorded_at FROM price_history
@@ -492,12 +495,14 @@ async def update_price_history(conn, market_id, yes_price):
         INSERT INTO price_history (market_id, yes_price, recorded_at) VALUES ($1,$2,$3)
     """, market_id, yes_price, now())
 
+
 async def get_price_history(conn, market_id, limit=20):
     rows = await conn.fetch("""
         SELECT yes_price, recorded_at FROM price_history
         WHERE market_id=$1 ORDER BY recorded_at DESC LIMIT $2
     """, market_id, limit)
     return rows
+
 
 async def log_sentiment(conn, fear_greed):
     await conn.execute("""
@@ -506,43 +511,45 @@ async def log_sentiment(conn, fear_greed):
     """, fear_greed["score"], fear_greed["classification"],
         fear_greed["regime"], fear_greed.get("trend", "UNKNOWN"), now())
 
+
 async def get_daily_stats(conn):
     return await conn.fetch("""
         SELECT * FROM alerts WHERE alerted_at > NOW() - INTERVAL '24 hours'
     """)
 
+
 async def get_alerted_markets(conn):
     rows = await conn.fetch("SELECT DISTINCT market_id FROM alerts")
     return set(r["market_id"] for r in rows)
+
 
 async def get_logged_opportunities(conn):
     rows = await conn.fetch("SELECT DISTINCT market_id FROM opportunities_log")
     return set(r["market_id"] for r in rows)
 
-async def update_open_positions(conn):
-    """
-    Called every scan. For each open trade position:
-    - Fetches current market price
-    - Updates peak_price if price has risen
-    - Closes position with TAKE_PROFIT if return >= +40%
-    - Closes position with STOP_LOSS if return <= -25%
-    Returns list of closed positions for Telegram notification.
-    """
-    import aiohttp, json as _json
 
-    open_positions = await conn.fetch("""
-        SELECT tp.*, a.question, a.entry_price as alert_entry
-        FROM trade_positions tp
-        JOIN alerts a ON tp.alert_id = a.id
-        WHERE tp.is_open = TRUE
-        AND tp.opened_at < NOW() - INTERVAL '10 minutes'
-    """)
+async def update_open_positions(pool):
+    """
+    Called every scan. Uses pool so each market fetch gets its own
+    connection — no blocking while waiting on HTTP responses.
+    """
+    import aiohttp
+    import json as _json
+
+    async with pool.acquire() as conn:
+        open_positions = await conn.fetch("""
+            SELECT tp.*, a.question, a.entry_price as alert_entry
+            FROM trade_positions tp
+            JOIN alerts a ON tp.alert_id = a.id
+            WHERE tp.is_open = TRUE
+            AND tp.opened_at < NOW() - INTERVAL '10 minutes'
+        """)
 
     if not open_positions:
         return []
 
-    TAKE_PROFIT_PCT = 40.0   # close at +40% gain
-    STOP_LOSS_PCT   = -25.0  # close at -25% loss
+    TAKE_PROFIT_PCT = 40.0
+    STOP_LOSS_PCT   = -25.0
 
     closed = []
     headers = {
@@ -563,7 +570,6 @@ async def update_open_positions(conn):
                         continue
                     market = markets[0]
 
-                    # Pull current price
                     outcomes = market.get("outcomePrices", "[]")
                     if isinstance(outcomes, str):
                         outcomes = _json.loads(outcomes)
@@ -578,24 +584,22 @@ async def update_open_positions(conn):
                     return_pct = round((current_price - entry) / entry * 100, 2)
                     new_peak = max(pos["peak_price"], current_price)
 
-                    # Update peak and current price regardless
-                    await conn.execute("""
-                        UPDATE trade_positions
-                        SET current_price=$1, peak_price=$2
-                        WHERE id=$3
-                    """, current_price, new_peak, pos["id"])
+                    # Each DB operation gets its own connection from the pool
+                    async with pool.acquire() as conn:
+                        await conn.execute("""
+                            UPDATE trade_positions
+                            SET current_price=$1, peak_price=$2
+                            WHERE id=$3
+                        """, current_price, new_peak, pos["id"])
 
-                    # Also keep alerts.peak_price fresh
-                    peak_return = round((new_peak - entry) / entry * 100, 2)
-                    await conn.execute("""
-                        UPDATE alerts SET peak_price=$1, peak_return_pct=$2
-                        WHERE id=$3
-                    """, new_peak, peak_return, pos["alert_id"])
+                        peak_return = round((new_peak - entry) / entry * 100, 2)
+                        await conn.execute("""
+                            UPDATE alerts SET peak_price=$1, peak_return_pct=$2
+                            WHERE id=$3
+                        """, new_peak, peak_return, pos["alert_id"])
 
-                    # Track timing — when peak hit, when first/last profitable
-                    await update_position_timing(conn, pos["alert_id"], current_price, entry)
+                        await update_position_timing(conn, pos["alert_id"], current_price, entry)
 
-                    # Check market resolved
                     market_closed = market.get("closed", False)
                     exit_reason = None
                     outcome_type = None
@@ -619,19 +623,11 @@ async def update_open_positions(conn):
 
                     if exit_reason:
                         profitable = outcome_type in ("FULL_WIN", "PARTIAL_WIN")
-                        await conn.execute("""
-                            UPDATE trade_positions
-                            SET is_open=FALSE, closed_at=$1, exit_reason=$2,
-                                exit_price=$3, return_pct=$4, outcome_type=$5
-                            WHERE id=$6
-                        """, now(), exit_reason, current_price, return_pct, outcome_type, pos["id"])
 
-                        # Derive hold duration
                         hold_secs = (now() - pos["opened_at"]).total_seconds()
                         hold_hours = round(hold_secs / 3600, 1)
                         actual_hold_days = round(hold_secs / 86400, 2)
 
-                        # Derive loss pattern
                         loss_pattern = None
                         if not profitable:
                             if exit_reason == "STOP_LOSS" and pos["peak_price"] > entry:
@@ -641,7 +637,6 @@ async def update_open_positions(conn):
                             elif exit_reason == "RESOLVED":
                                 loss_pattern = "NEVER_MOVED"
 
-                        # Derive loss reason
                         loss_reason = None
                         if not profitable:
                             loss_reason = derive_loss_reason(
@@ -650,23 +645,32 @@ async def update_open_positions(conn):
                                 peak_price=pos["peak_price"]
                             )
 
-                        await conn.execute("""
-                            UPDATE alerts
-                            SET outcome=$1, profitable=$2, outcome_type=$3,
-                                exit_price=$4, exit_return_pct=$5, exit_reason=$6,
-                                hold_duration_hours=$7, loss_pattern=$8,
-                                resolution_price=$9, loss_reason=$10,
-                                actual_hold_days=$11
-                            WHERE id=$12
-                        """,
-                            exit_reason, profitable, outcome_type,
-                            current_price, return_pct, exit_reason,
-                            hold_hours, loss_pattern,
-                            current_price, loss_reason,
-                            actual_hold_days, pos["alert_id"]
-                        )
+                        async with pool.acquire() as conn:
+                            await conn.execute("""
+                                UPDATE trade_positions
+                                SET is_open=FALSE, closed_at=$1, exit_reason=$2,
+                                    exit_price=$3, return_pct=$4, outcome_type=$5
+                                WHERE id=$6
+                            """, now(), exit_reason, current_price, return_pct, outcome_type, pos["id"])
 
-                        await update_risk_state(conn, profitable)
+                            await conn.execute("""
+                                UPDATE alerts
+                                SET outcome=$1, profitable=$2, outcome_type=$3,
+                                    exit_price=$4, exit_return_pct=$5, exit_reason=$6,
+                                    hold_duration_hours=$7, loss_pattern=$8,
+                                    resolution_price=$9, loss_reason=$10,
+                                    actual_hold_days=$11
+                                WHERE id=$12
+                            """,
+                                exit_reason, profitable, outcome_type,
+                                current_price, return_pct, exit_reason,
+                                hold_hours, loss_pattern,
+                                current_price, loss_reason,
+                                actual_hold_days, pos["alert_id"]
+                            )
+
+                            await update_risk_state(conn, profitable)
+
                         closed.append({
                             "question": pos["question"],
                             "entry_price": entry,
@@ -692,26 +696,11 @@ async def update_open_positions(conn):
     return closed
 
 
-
 def derive_loss_reason(entry, resolution_price, alert_yes_price, peak_price=None):
-    """
-    Classifies WHY a losing trade lost. Called at resolution time.
-
-    WRONG_DIRECTION  — market resolved opposite to our bet
-                       (we bet YES on a <0.5 market, it resolved NO)
-    NO_MOVEMENT      — price barely changed from entry to resolution
-                       (within 10% relative move — market just sat there)
-    REVERSAL         — price moved our way at some point (peak > entry)
-                       but ultimately resolved against us
-    WRONG_DIRECTION is the most critical to identify — it means the signal
-    itself is broken, not just timing or hold duration.
-    """
     if resolution_price is None or entry is None or entry == 0:
         return None
 
     price_change_pct = abs(resolution_price - entry) / entry * 100
-
-    # Was this a directional loss? (bet YES on low-prob market, resolved NO)
     bet_yes = entry < 0.5
     resolved_yes = resolution_price >= 0.99
     resolved_no = resolution_price <= 0.01
@@ -721,24 +710,22 @@ def derive_loss_reason(entry, resolution_price, alert_yes_price, peak_price=None
     if not bet_yes and resolved_yes:
         return "WRONG_DIRECTION"
 
-    # Price barely moved
     if price_change_pct < 10:
         return "NO_MOVEMENT"
 
-    # Was there ever a profitable peak before the loss?
     if peak_price and peak_price > entry:
         return "REVERSAL"
 
-    # Default — moved the wrong way without ever being profitable
     return "WRONG_DIRECTION"
 
 
 async def check_resolutions(conn):
     """
     Legacy full-resolution check (runs on schedule).
-    Catches any markets that closed without being caught by update_open_positions.
+    Catches markets that closed without being caught by update_open_positions.
     """
-    import aiohttp, json as _json
+    import aiohttp
+    import json as _json
 
     unresolved_alerts = await conn.fetch("""
         SELECT * FROM alerts WHERE outcome IS NULL
@@ -796,7 +783,6 @@ async def check_resolutions(conn):
                                     table = "alerts" if "alerted_at" in alert.keys() else "opportunities_log"
 
                                     if table == "alerts":
-                                        # Derive loss pattern from price history
                                         loss_pattern = None
                                         if not profitable:
                                             history = await conn.fetch("""
@@ -821,7 +807,6 @@ async def check_resolutions(conn):
                                                 else:
                                                     loss_pattern = "SUDDEN_DROP"
 
-                                        # Derive hold duration
                                         hold_hours = None
                                         actual_hold_days = None
                                         alerted_at = alert.get("alerted_at")
@@ -830,7 +815,6 @@ async def check_resolutions(conn):
                                             hold_hours = round(hold_secs / 3600, 1)
                                             actual_hold_days = round(hold_secs / 86400, 2)
 
-                                        # Derive loss reason
                                         peak_p = float(alert.get("peak_price") or 0) or None
                                         loss_reason = None
                                         if not profitable:
@@ -840,7 +824,6 @@ async def check_resolutions(conn):
                                                 peak_price=peak_p
                                             )
 
-                                        # Fetch volume at resolution
                                         vol_at_res = market.get("volume")
                                         try:
                                             vol_at_res = float(vol_at_res) if vol_at_res else None
@@ -876,11 +859,6 @@ async def check_resolutions(conn):
 
 
 async def run_weekly_backtest(conn):
-    """
-    Runs every Sunday. Analyses closed positions to find which signals,
-    categories, confidence tiers, and fear/greed regimes actually win.
-    Returns a formatted summary string for Telegram.
-    """
     rows = await conn.fetch("""
         SELECT category, confidence_tier, fear_greed_regime, signals_fired,
                outcome_type, exit_return_pct, peak_return_pct, profitable,
@@ -901,14 +879,12 @@ async def run_weekly_backtest(conn):
     live_rows = [r for r in rows if not r.get("is_backfilled")]
     returns = [r["exit_return_pct"] for r in live_rows if r["exit_return_pct"] is not None]
     avg_return = round(sum(returns) / len(returns), 1) if returns else None
-
     peak_returns = [r["peak_return_pct"] for r in live_rows if r["peak_return_pct"] is not None]
     avg_peak = round(sum(peak_returns) / len(peak_returns), 1) if peak_returns else None
 
     avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
     avg_peak_str = ("+" + str(avg_peak) + "%") if avg_peak is not None else "tracking soon"
 
-    # Win rate by category
     by_category = {}
     for r in rows:
         cat = r["category"] or "Unknown"
@@ -922,7 +898,6 @@ async def run_weekly_backtest(conn):
         wr = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
         cat_lines.append(f"  {cat}: {wr}% ({d['total']} trades)")
 
-    # Win rate by confidence tier
     by_tier = {}
     for r in rows:
         tier = r["confidence_tier"] or "Unknown"
@@ -938,7 +913,6 @@ async def run_weekly_backtest(conn):
             wr = round(d["wins"] / d["total"] * 100, 1)
             tier_lines.append(f"  {tier}: {wr}% ({d['total']} trades)")
 
-    # Top signals analysis
     signal_stats = {}
     for r in rows:
         sigs = r["signals_fired"] or ""
@@ -956,7 +930,6 @@ async def run_weekly_backtest(conn):
         wr = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
         sig_lines.append(f"  {sig}: {wr}% ({d['total']} trades)")
 
-    # Outcome type breakdown
     outcome_counts = {}
     for r in rows:
         ot = r["outcome_type"] or "UNKNOWN"
@@ -964,9 +937,6 @@ async def run_weekly_backtest(conn):
 
     outcome_lines = [f"  {k}: {v}" for k, v in sorted(outcome_counts.items(), key=lambda x: -x[1])]
 
-    sig_section = sig_lines if sig_lines else ["  No signal data yet"]
-
-    # Win rate by market type
     by_market_type = {}
     for r in rows:
         mt = r.get("market_type") or "Unknown"
@@ -974,12 +944,12 @@ async def run_weekly_backtest(conn):
         by_market_type[mt]["total"] += 1
         if r["profitable"]:
             by_market_type[mt]["wins"] += 1
+
     mt_lines = []
     for mt, d in sorted(by_market_type.items(), key=lambda x: -x[1]["total"]):
         wr = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
         mt_lines.append(f"  {mt}: {wr}% ({d['total']} trades)")
 
-    # Loss pattern breakdown
     loss_patterns = {}
     for r in rows:
         if not r["profitable"] and r.get("loss_pattern"):
@@ -988,7 +958,6 @@ async def run_weekly_backtest(conn):
     lp_lines = [f"  {k}: {v}" for k, v in sorted(loss_patterns.items(), key=lambda x: -x[1])]
     lp_section = lp_lines if lp_lines else ["  No loss pattern data yet"]
 
-    # Loss reason breakdown (the actionable one)
     loss_reasons = {}
     for r in rows:
         if not r["profitable"] and r.get("loss_reason"):
@@ -1001,12 +970,10 @@ async def run_weekly_backtest(conn):
         lr_lines.append(f"  {k}: {v} ({pct}%)")
     lr_section = lr_lines if lr_lines else ["  No loss reason data yet"]
 
-    # Avg hold duration
     hold_times = [r.get("hold_duration_hours") for r in rows if r.get("hold_duration_hours")]
     avg_hold = round(sum(hold_times) / len(hold_times), 1) if hold_times else None
     hold_str = f"{avg_hold}h" if avg_hold else "tracking soon"
 
-    # Win rate by hour of day
     by_hour = {}
     for r in rows:
         h = r.get("hour_of_day_utc")
@@ -1018,10 +985,12 @@ async def run_weekly_backtest(conn):
                 by_hour[bucket]["wins"] += 1
     hour_lines = []
     for h, d in sorted(by_hour.items()):
-        if d["total"] >= 3:  # only show hours with enough data
+        if d["total"] >= 3:
             wr = round(d["wins"] / d["total"] * 100, 1)
             hour_lines.append(f"  {h} UTC: {wr}% ({d['total']} trades)")
     hour_section = hour_lines if hour_lines else ["  Need more data (min 3 trades/hour)"]
+
+    sig_section = sig_lines if sig_lines else ["  No signal data yet"]
 
     lines = [
         "📊 <b>Weekly Backtest Report</b>",
@@ -1059,14 +1028,8 @@ async def run_weekly_backtest(conn):
     return "\n".join(lines)
 
 
-# ── RICH DATA COLLECTION FUNCTIONS ────────────────────────────────────────────
-
 async def record_alert_snapshot(conn, alert_id, market_id, yes_price,
                                   alerted_at, bid_price=None, ask_price=None):
-    """
-    Records a price snapshot for an alerted market every 15 minutes
-    for 48 hours after the alert fired.
-    """
     last = await conn.fetchrow("""
         SELECT recorded_at FROM alert_price_snapshots
         WHERE alert_id = $1 ORDER BY recorded_at DESC LIMIT 1
@@ -1092,9 +1055,6 @@ async def record_alert_snapshot(conn, alert_id, market_id, yes_price,
 
 
 async def update_position_timing(conn, alert_id, current_price, entry_price):
-    """
-    Tracks peak_reached_at, first_profitable_at, last_profitable_at.
-    """
     alert = await conn.fetchrow("""
         SELECT peak_price, peak_reached_at, first_profitable_at, entry_price
         FROM alerts WHERE id = $1
@@ -1124,7 +1084,6 @@ async def update_position_timing(conn, alert_id, current_price, entry_price):
 
 
 async def get_alert_price_curve(conn, alert_id):
-    """Returns the full post-alert price curve for a given alert."""
     rows = await conn.fetch("""
         SELECT yes_price, bid_price, ask_price, recorded_at, minutes_since_alert
         FROM alert_price_snapshots
@@ -1135,7 +1094,6 @@ async def get_alert_price_curve(conn, alert_id):
 
 
 async def cleanup_old_snapshots(conn):
-    """Removes snapshots older than 30 days. Called weekly."""
     await conn.execute("""
         DELETE FROM alert_price_snapshots
         WHERE recorded_at < NOW() - INTERVAL '30 days'
