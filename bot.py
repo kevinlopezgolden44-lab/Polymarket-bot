@@ -100,6 +100,9 @@ async def fetch_all_markets():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
     }
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 3
+
     async with aiohttp.ClientSession() as session:
         while offset < CONFIG["max_pages"] * CONFIG["markets_per_page"]:
             url = (
@@ -109,27 +112,54 @@ async def fetch_all_markets():
                 + "&offset=" + str(offset)
                 + "&order=volume24hr&ascending=false"
             )
-            try:
-                async with session.get(url, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        markets = await resp.json()
-                        if not markets:
+            page = offset // CONFIG["markets_per_page"] + 1
+            page_ok = False
+
+            for attempt in range(3):
+                try:
+                    async with session.get(url, headers=headers,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            markets = await resp.json()
+                            if not markets:
+                                log.info("Page %d: empty — end of markets", page)
+                                return all_markets
+                            all_markets.extend(markets)
+                            log.info("Page %d: %d markets (total: %d)",
+                                     page, len(markets), len(all_markets))
+                            if len(markets) < CONFIG["markets_per_page"]:
+                                return all_markets
+                            page_ok = True
                             break
-                        all_markets.extend(markets)
-                        page = offset // CONFIG["markets_per_page"] + 1
-                        log.info("Page %d: %d markets (total: %d)",
-                                 page, len(markets), len(all_markets))
-                        if len(markets) < CONFIG["markets_per_page"]:
-                            break
-                        offset += CONFIG["markets_per_page"]
-                        await asyncio.sleep(0.5)
-                    else:
-                        log.error("API error: %d", resp.status)
-                        break
-            except Exception as e:
-                log.error("Fetch error: %s", e)
-                break
+                        elif resp.status == 429:
+                            wait = 2 ** attempt
+                            log.warning("Page %d: rate limited, retrying in %ds", page, wait)
+                            await asyncio.sleep(wait)
+                        else:
+                            log.warning("Page %d: API error %d (attempt %d/3)",
+                                        page, resp.status, attempt + 1)
+                            await asyncio.sleep(1)
+                except asyncio.TimeoutError:
+                    log.warning("Page %d: timeout (attempt %d/3)", page, attempt + 1)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    log.warning("Page %d: fetch error (attempt %d/3): %s", page, attempt + 1, e)
+                    await asyncio.sleep(1)
+
+            if page_ok:
+                consecutive_failures = 0
+                offset += CONFIG["markets_per_page"]
+                await asyncio.sleep(0.3)
+            else:
+                consecutive_failures += 1
+                log.error("Page %d: failed after 3 attempts (consecutive failures: %d)",
+                          page, consecutive_failures)
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    log.error("Stopping fetch after %d consecutive page failures", consecutive_failures)
+                    break
+                # Skip this page and continue to the next
+                offset += CONFIG["markets_per_page"]
+
     return all_markets
 
 
