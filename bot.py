@@ -75,6 +75,21 @@ TENNIS_KEYWORDS = [
     "atp ", "wta ", "open tennis", "wimbledon",
     "french open", "us open tennis", "roland garros"
 ]
+GOLF_KEYWORDS = [
+    "pga tour", "pga championship", "masters golf", "the masters",
+    "us open golf", "the open championship", "ryder cup",
+    "shot", "birdie", "bogey", "fairway", "leaderboard",
+    "round 1", "round 2", "round 3", "round 4",
+    "stroke play", "match play", "hole in one",
+    # Player names most likely to appear in golf markets
+    "scottie scheffler", "rory mcilroy", "viktor hovland",
+    "jon rahm", "xander schauffele", "collin morikawa",
+    "tiger woods", "phil mickelson", "dustin johnson",
+]
+SOCIAL_COUNT_PATTERN = re.compile(
+    r'(post|tweet|share) \d+[\-+]\d* (tweet|post|time|x post|message)',
+    re.IGNORECASE
+)
 SHORT_WINDOW_KEYWORDS = ["up or down", "pump or dump", "higher or lower", "above or below"]
 OVER_UNDER_KEYWORDS   = ["o/u ", ": o/u", "over/under", "total points", "total runs", "total goals"]
 FUTURES_KEYWORDS = [
@@ -246,6 +261,8 @@ def _should_skip_market(question_lower):
         return True
     if any(kw in question_lower for kw in TENNIS_KEYWORDS):
         return True
+    if any(kw in question_lower for kw in GOLF_KEYWORDS):
+        return True
     if any(kw in question_lower for kw in SHORT_WINDOW_KEYWORDS):
         return True
     if any(kw in question_lower for kw in OVER_UNDER_KEYWORDS):
@@ -253,6 +270,10 @@ def _should_skip_market(question_lower):
     if any(kw in question_lower for kw in FUTURES_KEYWORDS):
         return True
     if FUTURES_PATTERN.search(question_lower):
+        return True
+    # Tweet/post count bucket markets e.g. "post 360-379 tweets"
+    # Only one bucket can resolve YES — guaranteed losses on all others
+    if SOCIAL_COUNT_PATTERN.search(question_lower):
         return True
     return False
 
