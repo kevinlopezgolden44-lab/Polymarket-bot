@@ -334,6 +334,11 @@ async def init_db(conn):
         ("loss_reason", "TEXT"),
         ("volume_at_resolution", "FLOAT"),
         ("actual_hold_days", "FLOAT"),
+        ("direction", "TEXT"),
+        ("edge_pct", "FLOAT"),
+        ("vegas_gap", "FLOAT"),
+        ("vegas_implied", "FLOAT"),
+        ("spread", "FLOAT"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
