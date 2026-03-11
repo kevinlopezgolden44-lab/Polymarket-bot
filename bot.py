@@ -21,6 +21,7 @@ from research import (
     get_fear_greed, build_research_summary, get_crypto_data,
     prefetch_all_crypto, get_sports_odds,
     prefetch_sports_odds, detect_sport_key, FUTURES_ONLY_SPORT_KEYS,
+    load_sports_quota_state,
 )
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -313,6 +314,7 @@ async def main():
         await init_db(conn)
         await seed_event_calendar(conn)
         await reset_loss_streak(conn)
+        await load_sports_quota_state(conn)  # restore quota circuit breaker from DB
 
     await send_message(
         TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,

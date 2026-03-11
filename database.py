@@ -291,6 +291,12 @@ async def init_db(conn):
             category TEXT NOT NULL,
             relevance_keywords TEXT NOT NULL,
             created_at TIMESTAMP NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP NOT NULL
         )
     """)
 
@@ -1126,3 +1132,18 @@ async def cleanup_old_snapshots(conn):
         WHERE recorded_at < NOW() - INTERVAL '30 days'
     """)
     log.info("Cleaned up old price snapshots")
+
+# ── BOT STATE (persistent key-value, survives redeploys) ───────────────────────
+async def get_state(conn, key: str) -> str | None:
+    """Read a value from bot_state. Returns None if key doesn't exist."""
+    row = await conn.fetchrow("SELECT value FROM bot_state WHERE key = $1", key)
+    return row["value"] if row else None
+
+
+async def set_state(conn, key: str, value: str) -> None:
+    """Upsert a value into bot_state."""
+    await conn.execute("""
+        INSERT INTO bot_state (key, value, updated_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3
+    """, key, value, __import__('datetime').datetime.utcnow())

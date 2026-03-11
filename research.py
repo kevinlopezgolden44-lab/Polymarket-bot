@@ -343,7 +343,28 @@ THERUNDOWN_SPORT_IDS = {
 # Each request returns ~6 dp per game. With 4 sports × 8 games = ~200dp/request.
 # At 5min TTL: ~72k dp/day (OVER LIMIT). At 30min TTL: ~12k dp/day (safe).
 # Odds for a given day's games don't change much — 30min refresh is plenty.
-_sports_odds_cache: dict = {}
+_sports_odds_cache: dict = {}       # sport_key -> {games, fetched_at}
+_sports_quota_exhausted: bool = False  # True after first 429 — reset at midnight
+_sports_quota_reset_date: str = ""     # date string when quota was exhausted
+
+
+async def load_sports_quota_state(conn) -> None:
+    """
+    Called once at bot startup. Restores quota-exhausted flag from DB so
+    redeployments don't reset the circuit breaker mid-day.
+    """
+    global _sports_quota_exhausted, _sports_quota_reset_date
+    from database import get_state
+    today = __import__('datetime').datetime.utcnow().strftime("%Y-%m-%d")
+    stored_date = await get_state(conn, "therundown_quota_exhausted_date")
+    if stored_date == today:
+        _sports_quota_exhausted = True
+        _sports_quota_reset_date = today
+        log.warning("TheRundown: quota was exhausted earlier today — sports odds disabled until midnight UTC")
+    else:
+        _sports_quota_exhausted = False
+        _sports_quota_reset_date = today
+        log.info("TheRundown: quota state loaded — fresh quota available")
 SPORTS_CACHE_TTL_SECONDS = 1800  # 30 minutes — keeps usage ~60% of daily limit
 # ── AUTO-TRADING NOTE ─────────────────────────────────────────────────────────
 # When auto-trading is enabled, reduce this to 300 (5 min) or 900 (15 min).
@@ -402,6 +423,18 @@ async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
     env var or add THERUNDOWN_API_KEY alongside the old one.
     Returns a normalised list of game dicts (home_team, away_team, odds).
     """
+    global _sports_quota_exhausted, _sports_quota_reset_date
+
+    # Circuit breaker: if quota exhausted today, don't retry until tomorrow
+    today = now().strftime("%Y-%m-%d")
+    if _sports_quota_exhausted and _sports_quota_reset_date == today:
+        log.debug("TheRundown: quota exhausted today, skipping API call for %s", sport_key)
+        return []
+    elif _sports_quota_reset_date != today:
+        # New day — reset circuit breaker
+        _sports_quota_exhausted = False
+        _sports_quota_reset_date = today
+
     cached = _sports_odds_cache.get(sport_key)
     if cached:
         age = (now() - cached["fetched_at"]).total_seconds()
@@ -434,7 +467,25 @@ async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
                 elif resp.status == 401:
                     log.error("TheRundown: 401 — invalid API key (check THERUNDOWN_API_KEY in Railway)")
                 elif resp.status == 429:
-                    log.warning("TheRundown: 429 — daily quota exhausted (20k/day free tier)")
+                    _sports_quota_exhausted = True
+                    _sports_quota_reset_date = now().strftime("%Y-%m-%d")
+                    log.warning(
+                        "TheRundown: 429 — daily quota exhausted (20k/day free tier). "
+                        "Sports odds disabled until midnight UTC."
+                    )
+                    # Persist so redeployments don't reset the circuit breaker
+                    try:
+                        from database import set_state
+                        import asyncpg
+                        _db_url = __import__('os').environ.get("DATABASE_URL", "")
+                        if _db_url:
+                            _tmp_conn = await asyncpg.connect(_db_url)
+                            try:
+                                await set_state(_tmp_conn, "therundown_quota_exhausted_date", _sports_quota_reset_date)
+                            finally:
+                                await _tmp_conn.close()
+                    except Exception as _e:
+                        log.debug("Could not persist quota state: %s", _e)
                 else:
                     log.warning("TheRundown status %d for %s", resp.status, sport_key)
     except Exception as e:
