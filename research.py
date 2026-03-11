@@ -302,7 +302,14 @@ SPORTS_DETECTION_MAP = [
 # Sports that only have futures/outrights — no per-game h2h odds exist.
 # Vegas divergence doesn't apply; skip the API call entirely.
 # Sports with no per-game h2h odds (futures/outright only)
-FUTURES_ONLY_SPORTS = {18}  # FIFA World Cup — no single-game h2h markets
+# Sport keys with no per-game h2h odds — skip Vegas lookup entirely
+FUTURES_ONLY_SPORT_KEYS = {
+    "golf_masters_tournament_winner",
+    "golf_pga_championship",
+    "golf_the_open_championship",
+    "golf_pga_tour",
+    "soccer_fifa_world_cup_winner",
+}
 
 # ── THERUNDOWN API — SPORT ID MAP ─────────────────────────────────────────────
 # TheRundown uses numeric sport IDs. Free tier: 20,000 data points/day.
@@ -458,10 +465,11 @@ async def get_sports_odds(question, odds_api_key, prefetched_games: list | None 
         log.info("No sport detected for Vegas lookup: %s", question[:60])
         return {"success": False, "reason": "no_sport_detected"}
 
-    sport_id = THERUNDOWN_SPORT_IDS.get(sport_key)
-    if sport_id in FUTURES_ONLY_SPORTS:
+    if sport_key in FUTURES_ONLY_SPORT_KEYS:
         log.info("Futures-only sport, skipping h2h lookup: %s", sport_key)
         return {"success": False, "reason": "futures_only_sport"}
+
+    sport_id = THERUNDOWN_SPORT_IDS.get(sport_key)
 
     if prefetched_games is not None:
         games = prefetched_games

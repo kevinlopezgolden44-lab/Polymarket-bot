@@ -32,6 +32,11 @@ def detect_category(question):
     if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp", "ripple"]):
         return "Crypto"
 
+    # "Team A vs. Team B" — strongest signal for any head-to-head matchup
+    # catches college games, international fixtures, any sport not in keyword list
+    if " vs " in q or " vs. " in q:
+        return "Sports"
+
     sports_keywords = [
         # Leagues / tournaments
         "nba", "nfl", "mlb", "nhl", "ufc", "soccer", "world cup", "champions league",
@@ -54,6 +59,9 @@ def detect_category(question):
         "knockout", "submission", "mma fight", "boxing match",
         # Soccer clubs
         "manchester", "barcelona", "real madrid", "liverpool", "arsenal", "chelsea",
+        # College sports indicators
+        "wildcats", "panthers", "bulldogs", "tigers", "bears", "wolves", "eagles",
+        "a&m", "university", "college game",
     ]
     if any(w in q for w in sports_keywords):
         return "Sports"
@@ -381,6 +389,16 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     if age_hours is not None and age_hours < 24:
         score += 5
         confirming += 1
+
+    # ── Sports without Vegas signal: cap score below alert threshold ──────────
+    # Sports edge comes from Vegas gap. Without it, sentiment/timing bonuses
+    # alone (Extreme Fear +10, resolves soon +10, new market +5) can push a
+    # college game with no real signal to 85+ and trigger a false alert.
+    # Cap at 70 so it logs as an opportunity but never alerts.
+    if category == "Sports" and vegas_gap is None:
+        score = min(score, 70)
+        if score == 70:
+            flags.append("SPORTS: no Vegas gap signal — capped at 70, not alerting")
 
     # ── Clamp score ────────────────────────────────────────────────────────────
     score = max(0, min(100, score))

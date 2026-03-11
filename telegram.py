@@ -85,6 +85,14 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
         "  Max Trade:   $" + str(limits["max_trade_size"]) + "\n"
     )
 
+    # Direction + edge
+    direction = opp.get("direction", "NO_EDGE")
+    edge_pct  = opp.get("edge_pct")
+    if direction != "NO_EDGE":
+        dir_emoji = "🟢" if direction == "BUY_YES" else "🔴"
+        edge_str = f" ({edge_pct:.1f}% edge)" if edge_pct else ""
+        msg += f"\n{dir_emoji} <b>Signal:</b> {direction}{edge_str}\n"
+
     if opp.get("age") and opp["age"] < 24:
         msg += "\n🆕 <b>New Market:</b> Only " + str(round(opp["age"])) + "h old\n"
 

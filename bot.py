@@ -46,6 +46,16 @@ CONFIG = {
     # Connection pool settings
     "pool_min_size": 2,
     "pool_max_size": 10,
+    # Market filters
+    "min_volume_24h": 1000,         # Skip markets with thin liquidity
+    "min_yes_price": 0.02,          # Skip near-zero YES price (market decided)
+    "max_yes_price": 0.98,          # Skip near-certain YES price (market decided)
+    "coin_flip_low": 0.44,          # Coin-flip filter: YES price range
+    "coin_flip_high": 0.56,
+    "coin_flip_max_hours": 4,       # Coin-flip filter: resolves within N hours
+    # Position management
+    "take_profit_pct": 40.0,        # Exit at +40%
+    "stop_loss_pct": -25.0,         # Exit at -25%
 }
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -485,13 +495,13 @@ async def main():
                                 str(_end_chk).replace("Z", "+00:00")
                             ).replace(tzinfo=None)
                             _hrs_to_res = (_end_dt_chk - now()).total_seconds() / 3600
-                            if _hrs_to_res < 4 and 0.44 <= _yes_chk <= 0.56:
+                            if _hrs_to_res < CONFIG["coin_flip_max_hours"] and CONFIG["coin_flip_low"] <= _yes_chk <= CONFIG["coin_flip_high"]:
                                 continue
                     except Exception:
                         pass
 
                     # Minimum volume filter
-                    if float(market.get("volume24hr", 0) or 0) < 1000:
+                    if float(market.get("volume24hr", 0) or 0) < CONFIG["min_volume_24h"]:
                         continue
 
                     # YES price bounds filter
@@ -500,7 +510,7 @@ async def main():
                         if isinstance(_outcomes_price, str):
                             _outcomes_price = json.loads(_outcomes_price)
                         _yes_price_chk = float(_outcomes_price[0]) if _outcomes_price else 0.5
-                        if _yes_price_chk < 0.02 or _yes_price_chk > 0.98:
+                        if _yes_price_chk < CONFIG["min_yes_price"] or _yes_price_chk > CONFIG["max_yes_price"]:
                             continue
                     except Exception:
                         pass
