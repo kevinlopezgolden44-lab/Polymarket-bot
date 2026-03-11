@@ -555,7 +555,8 @@ async def update_open_positions(pool):
 
     async with pool.acquire() as conn:
         open_positions = await conn.fetch("""
-            SELECT tp.*, a.question, a.entry_price as alert_entry
+            SELECT tp.*, a.question, a.entry_price as alert_entry,
+                   a.direction as alert_direction
             FROM trade_positions tp
             JOIN alerts a ON tp.alert_id = a.id
             WHERE tp.is_open = TRUE
@@ -623,10 +624,16 @@ async def update_open_positions(pool):
 
                     if market_closed:
                         exit_reason = "RESOLVED"
+                        # Use stored direction (BUY_YES/BUY_NO) — fallback to
+                        # entry price heuristic for alerts logged before direction
+                        # was added (entry < 0.5 implies a YES purchase).
+                        direction = pos.get("alert_direction") or (
+                            "BUY_YES" if entry < 0.5 else "BUY_NO"
+                        )
                         if current_price >= 0.99:
-                            outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
+                            outcome_type = "FULL_WIN" if direction == "BUY_YES" else "LOSS"
                         elif current_price <= 0.01:
-                            outcome_type = "LOSS" if entry < 0.5 else "FULL_WIN"
+                            outcome_type = "FULL_WIN" if direction == "BUY_NO" else "LOSS"
                         else:
                             outcome_type = "PARTIAL_WIN" if return_pct > 5 else (
                                 "BREAKEVEN" if return_pct > -5 else "LOSS"
@@ -782,12 +789,15 @@ async def check_resolutions(conn):
                                     entry = float(alert.get("entry_price") or alert["yes_price"])
                                     return_pct = round((final_yes - entry) / entry * 100, 2) if entry else 0
 
+                                    direction = alert.get("direction") or (
+                                        "BUY_YES" if entry < 0.5 else "BUY_NO"
+                                    )
                                     if final_yes >= 0.99:
                                         outcome = "YES"
-                                        outcome_type = "FULL_WIN" if entry < 0.5 else "LOSS"
+                                        outcome_type = "FULL_WIN" if direction == "BUY_YES" else "LOSS"
                                     elif final_yes <= 0.01:
                                         outcome = "NO"
-                                        outcome_type = "LOSS" if entry < 0.5 else "FULL_WIN"
+                                        outcome_type = "FULL_WIN" if direction == "BUY_NO" else "LOSS"
                                     else:
                                         outcome = "PARTIAL"
                                         outcome_type = (
