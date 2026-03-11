@@ -332,9 +332,20 @@ THERUNDOWN_SPORT_IDS = {
 }
 
 # ── SPORTS ODDS SCAN CACHE ────────────────────────────────────────────────────
-# Fetched ONCE per scan loop per sport, reused for all markets of that sport.
+# TheRundown free tier = 20,000 data points/day.
+# Each request returns ~6 dp per game. With 4 sports × 8 games = ~200dp/request.
+# At 5min TTL: ~72k dp/day (OVER LIMIT). At 30min TTL: ~12k dp/day (safe).
+# Odds for a given day's games don't change much — 30min refresh is plenty.
 _sports_odds_cache: dict = {}
-SPORTS_CACHE_TTL_SECONDS = 300  # 5 minutes — covers one full scan loop
+SPORTS_CACHE_TTL_SECONDS = 1800  # 30 minutes — keeps usage ~60% of daily limit
+# ── AUTO-TRADING NOTE ─────────────────────────────────────────────────────────
+# When auto-trading is enabled, reduce this to 300 (5 min) or 900 (15 min).
+# Rationale: Polymarket typically lags Vegas line moves by 15-60 min. At 30min
+# TTL the bot may enter a trade on a gap that has already closed if Polymarket
+# caught up faster than usual. Tighter TTL = more accurate gap detection at
+# entry time. Requires TheRundown paid plan (~$9/mo, 500k dp/day) to avoid
+# hitting the 20k/day free tier limit at 5-15min refresh rates.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def detect_sport_key(question: str) -> str | None:
