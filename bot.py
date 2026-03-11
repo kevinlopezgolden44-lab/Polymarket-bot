@@ -20,7 +20,7 @@ from scoring import score_opportunity, is_market_active, detect_category, detect
 from research import (
     get_fear_greed, build_research_summary, get_crypto_data,
     prefetch_all_crypto, get_sports_odds,
-    prefetch_sports_odds, detect_sport_key, FUTURES_ONLY_SPORTS,
+    prefetch_sports_odds, detect_sport_key, FUTURES_ONLY_SPORT_KEYS,
 )
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -445,7 +445,7 @@ async def main():
                 for _m in markets:
                     if detect_category(_m.get("question", "")) == "Sports":
                         _sk = detect_sport_key(_m.get("question", ""))
-                        if _sk and _sk not in FUTURES_ONLY_SPORTS and _sk not in seen_sport_keys:
+                        if _sk and _sk not in FUTURES_ONLY_SPORT_KEYS and _sk not in seen_sport_keys:
                             seen_sport_keys.add(_sk)
                             _games = await prefetch_sports_odds(_sk, THERUNDOWN_API_KEY)
                             if _games:
@@ -531,7 +531,7 @@ async def main():
                     if category == "Sports" and THERUNDOWN_API_KEY:
                         try:
                             _sk = detect_sport_key(market.get("question", ""))
-                            if _sk and _sk not in FUTURES_ONLY_SPORTS:
+                            if _sk and _sk not in FUTURES_ONLY_SPORT_KEYS:
                                 # Use already-fetched game list for this sport —
                                 # avoids a live API call per market (free tier: 500/month)
                                 _cached_games = _scan_odds_cache.get(_sk)
