@@ -555,7 +555,7 @@ async def main():
                     score = result["score"]
                     reason = result["reason"]
                     category = result["category"]
-                    market_age = result["signals"]["age_hours"]
+                    market_age = result["signals"].get("age_hours")
 
                     if score < CONFIG["log_opportunity_threshold"]:
                         continue
@@ -642,19 +642,19 @@ async def main():
                     }
 
                     # ── Analysis modules (using scoring results — no re-computation)
-                    liquidity = result["signals"]["liquidity"]
+                    liquidity = result["signals"].get("liquidity", {"liquid": True, "warning": None})
                     if not liquidity["liquid"]:
                         opp["liquidity_warning"] = liquidity["warning"]
 
-                    ambiguity = result["signals"]["ambiguity"]
+                    ambiguity = result["signals"].get("ambiguity")
                     if ambiguity:
                         opp["ambiguity_warning"] = ambiguity
 
-                    event_matches = result["signals"]["matched_events"]
+                    event_matches = result["signals"].get("matched_events", [])
                     if event_matches:
                         opp["upcoming_events"] = event_matches
 
-                    inconsistencies = result["signals"]["inconsistencies"]
+                    inconsistencies = result["signals"].get("inconsistencies", [])
                     if inconsistencies:
                         opp["inconsistencies"] = inconsistencies
 
