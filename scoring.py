@@ -211,6 +211,24 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         log.warning("score_opportunity: could not parse outcomePrices: %s", e)
         yes_price = 0.5
 
+    # ── Longshot filter ────────────────────────────────────────────────────────
+    # Entry price <10% means buying a longshot. Data shows 11.4% win rate at
+    # this range vs 50% win rate at 50-75%. Not tradeable edge.
+    if yes_price < 0.10:
+        return {
+            "score": 0,
+            "reason": f"FILTERED: yes_price {round(yes_price*100,1)}% too low — longshot, no edge",
+            "category": category,
+            "market_type": detect_market_type(question),
+            "confidence": "LOW",
+            "confirming": 0,
+            "contradicting": 0,
+            "direction": "NO_EDGE",
+            "edge_pct": None,
+            "flags": ["LONGSHOT_FILTERED"],
+            "signals": {},
+        }
+
     # ── Spread width filter ────────────────────────────────────────────────────
     # Wide spreads mean entry cost is too high — skip these markets entirely.
     # A spread > 0.06 (~6 cents on a binary) eats most of the edge before you start.
@@ -233,21 +251,70 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     # volume24hr is the best available proxy. We already check liquidity below.
     # True orderbook depth is stored via bid/ask at alert time for future analysis.
 
-    # ── Fear & Greed — Crypto only, modest weight ──────────────────────────────
-    # Only meaningful for crypto markets. Applied as a weak confirming/contradicting
-    # signal, not a baseline modifier for all categories.
+    # ── Fear & Greed — direction-aware, Crypto only ───────────────────────────
+    # The sentiment signal must know whether YES means "price goes UP" or
+    # "price goes DOWN". Applying contrarian logic to a downside target market
+    # is backwards — Extreme Fear confirms a dip, it doesn't contradict it.
+    #
+    # Market direction taxonomy:
+    #   UPSIDE  — "reach $X", "above $X", "gain X%", "exceed X%" — YES = price rises
+    #   DOWNSIDE — "dip to $X", "below $X", "drop to $X", "fall to $X" — YES = price falls
+    #   NEUTRAL — event markets, range markets, general — sentiment less applicable
+    #
+    # Sentiment logic by combination:
+    #   Extreme Fear  + UPSIDE   → contrarian BUY signal   (market oversold, likely to recover)
+    #   Extreme Fear  + DOWNSIDE → confirming YES signal   (fear drives the dip)
+    #   Extreme Greed + UPSIDE   → caution / contradicting (market overbought)
+    #   Extreme Greed + DOWNSIDE → contradicting YES       (greed = less likely to dip)
+
+    _q_lower = question.lower()
+    _downside_words = ["dip", "below", "drop to", "fall to", "crash", "under"]
+    _upside_words   = ["reach", "hit", "exceed", "above", "gain", "rise", "pump", "top"]
+    _is_downside = any(w in _q_lower for w in _downside_words)
+    _is_upside   = any(w in _q_lower for w in _upside_words)
+    # Default to upside if ambiguous — safer than assuming downside
+    _market_direction = "DOWNSIDE" if _is_downside and not _is_upside else "UPSIDE"
+
     fear_greed_signal = None
     if category == "Crypto" and fear_greed and fear_greed.get("success"):
         bonus = fear_greed.get("sentiment_bonus", 0)
+        regime = fear_greed.get("regime", "Unknown")
+
         if bonus != 0:
-            score += bonus
-            fear_greed_signal = fear_greed.get("regime", "Unknown")
-            if bonus > 0:
-                confirming += 1
-                flags.append(f"SENTIMENT: {fear_greed_signal} — contrarian buy signal")
+            fear_greed_signal = regime
+
+            if _market_direction == "DOWNSIDE":
+                # Flip the logic: Fear confirms downside targets, Greed contradicts them
+                if bonus > 0:
+                    # Extreme Fear — confirms dip is likely
+                    score += bonus
+                    confirming += 1
+                    flags.append(
+                        f"SENTIMENT: {regime} — fear confirms downside target likely"
+                    )
+                else:
+                    # Extreme Greed — market unlikely to dip
+                    score += bonus  # bonus is negative, so this reduces score
+                    contradicting += 1
+                    flags.append(
+                        f"SENTIMENT: {regime} — greed reduces downside probability"
+                    )
             else:
-                contradicting += 1
-                flags.append(f"SENTIMENT: {fear_greed_signal} — caution, market euphoric")
+                # UPSIDE market — original contrarian logic applies
+                if bonus > 0:
+                    # Extreme Fear — contrarian, market likely to recover upward
+                    score += bonus
+                    confirming += 1
+                    flags.append(
+                        f"SENTIMENT: {regime} — contrarian buy signal for upside target"
+                    )
+                else:
+                    # Extreme Greed — overbought, upside target less likely
+                    score += bonus
+                    contradicting += 1
+                    flags.append(
+                        f"SENTIMENT: {regime} — caution, market euphoric"
+                    )
 
     # ── Liquidity ──────────────────────────────────────────────────────────────
     liquidity = analyze_liquidity(market)
@@ -261,19 +328,45 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         confirming += 1
 
     # ── Price momentum ─────────────────────────────────────────────────────────
+    # Direction-aware: for DOWNSIDE markets, falling price = moving toward target.
     momentum = analyze_price_momentum(price_history_rows)
-    if momentum["signal"] in ("STRONG_RISING", "RISING"):
-        score += 15
-        confirming += 1
-    elif momentum["signal"] in ("STRONG_FALLING", "FALLING"):
-        score -= 10
-        contradicting += 1
+    if _market_direction == "DOWNSIDE":
+        if momentum["signal"] in ("STRONG_FALLING", "FALLING"):
+            score += 15
+            confirming += 1
+            flags.append("MOMENTUM: price falling — toward downside target")
+        elif momentum["signal"] in ("STRONG_RISING", "RISING"):
+            score -= 10
+            contradicting += 1
+            flags.append("MOMENTUM: price rising — away from downside target")
+    else:
+        if momentum["signal"] in ("STRONG_RISING", "RISING"):
+            score += 15
+            confirming += 1
+        elif momentum["signal"] in ("STRONG_FALLING", "FALLING"):
+            score -= 10
+            contradicting += 1
 
     # ── Price velocity ─────────────────────────────────────────────────────────
+    # Direction-aware: fast move DOWN on a DOWNSIDE market is confirming.
+    # Fast move UP on a DOWNSIDE market is contradicting.
     velocity = analyze_price_velocity(price_history_rows)
     if velocity["fast_move"]:
-        score += 10
-        confirming += 1
+        move_up = velocity["change"] > 0
+        if _market_direction == "DOWNSIDE":
+            if not move_up:
+                score += 10
+                confirming += 1
+            else:
+                score -= 5
+                contradicting += 1
+        else:
+            if move_up:
+                score += 10
+                confirming += 1
+            else:
+                score -= 5
+                contradicting += 1
         if velocity["alert"]:
             flags.append(velocity["alert"])
 
@@ -292,11 +385,11 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         flags.extend(inconsistencies)
 
     # ── Polymarket lag (Crypto) ────────────────────────────────────────────────
+    # NOTE: lag signal had 0/3 win rate, -38% avg return in diagnostic.
+    # Removed score bonus — keeping detection for logging only, not scoring.
     lag = detect_polymarket_lag(question, yes_price, crypto_data)
     if lag:
-        score += 20
-        confirming += 2
-        flags.append(lag)
+        flags.append(f"LAG_DETECTED (unscored): {lag}")
 
     # ── Vegas divergence (Sports) ──────────────────────────────────────────────
     # Compare Vegas implied probability to Polymarket price.
@@ -370,9 +463,17 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             days_to_res = round((end_dt - now()).total_seconds() / 86400, 1)
             if days_to_res is not None:
                 if days_to_res <= 3:
-                    score += 10
-                    confirming += 1
-                    flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
+                    # Only a bonus if there is genuine price movement possible.
+                    # A market at 4 cents resolving in 12h is decaying — not efficient.
+                    # Require yes_price > 0.20 to count as capital efficient.
+                    if yes_price >= 0.20:
+                        score += 10
+                        confirming += 1
+                        flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
+                    else:
+                        score -= 5
+                        contradicting += 1
+                        flags.append(f"RESOLVES SOON: {days_to_res}d — but low price suggests decaying market")
                 elif days_to_res <= 14:
                     score += 5   # mild bonus
                 elif days_to_res > 180:
@@ -400,6 +501,15 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         if score == 70:
             flags.append("SPORTS: no Vegas gap signal — capped at 70, not alerting")
 
+    # ── Time-of-day gate ───────────────────────────────────────────────────────
+    # Diagnostic shows hours 7-11 UTC and 17-19 UTC have 40-66% win rates.
+    # Hours 0-6, 12-16, 19-23 UTC are mostly losing. Cap score outside window.
+    hour_utc = now().hour
+    good_hours = set(range(7, 12)) | {17, 18, 19}
+    if hour_utc not in good_hours:
+        score = min(score, 70)
+        flags.append(f"TIME GATE: hour {hour_utc} UTC outside winning window (7-11, 17-19) — capped at 70")
+
     # ── Clamp score ────────────────────────────────────────────────────────────
     score = max(0, min(100, score))
 
@@ -408,22 +518,46 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     market_type = detect_market_type(question)
 
     # ── Directional recommendation ─────────────────────────────────────────────
-    # Tells you whether to buy YES or NO, and estimates edge percentage.
-    # Priority: Vegas gap > lag detection > no edge identified
+    # Priority: Vegas gap > momentum > velocity > no edge
+    # Removed lag direction — lag signal had 0/3 win rate in diagnostic.
+    # Expanded momentum: no longer requires price to be on specific side of 0.5.
     edge_pct = None
     direction = "NO_EDGE"
+
+    # For downside markets (dip/fall/drop targets), momentum is INVERTED:
+    # falling price = underlying moving toward YES resolution = BUY_YES
+    # rising price  = underlying moving away from YES resolution = BUY_NO
+    _downside_market = (_market_direction == "DOWNSIDE")
 
     if vegas_gap is not None and abs(vegas_gap) > 10:
         edge_pct = abs(vegas_gap)
         direction = "BUY_YES" if vegas_gap > 0 else "BUY_NO"
-    elif lag:
-        # Lag means market hasn't caught up to real-world data — always buy YES
-        direction = "BUY_YES"
-        edge_pct = round(abs(0.99 - yes_price) * 100, 1)
-    elif momentum["signal"] in ("STRONG_RISING", "RISING") and yes_price < 0.5:
-        direction = "BUY_YES"
-    elif momentum["signal"] in ("STRONG_FALLING", "FALLING") and yes_price > 0.5:
-        direction = "BUY_NO"
+
+    elif momentum["signal"] in ("STRONG_RISING", "RISING"):
+        if _downside_market:
+            # Price rising = moving AWAY from downside target = bet NO
+            direction = "BUY_NO"
+            edge_pct = round(abs(0.5 - yes_price) * 100, 1) if yes_price > 0.25 else None
+        else:
+            direction = "BUY_YES"
+            edge_pct = round(abs(yes_price - 0.5) * 100, 1) if yes_price < 0.75 else None
+
+    elif momentum["signal"] in ("STRONG_FALLING", "FALLING"):
+        if _downside_market:
+            # Price falling = moving TOWARD downside target = bet YES
+            direction = "BUY_YES"
+            edge_pct = round(abs(yes_price - 0.5) * 100, 1) if yes_price < 0.75 else None
+        else:
+            direction = "BUY_NO"
+            edge_pct = round(abs(0.5 - yes_price) * 100, 1) if yes_price > 0.25 else None
+
+    elif velocity["fast_move"]:
+        if _downside_market:
+            # Fast move down = approaching target = BUY_YES
+            direction = "BUY_YES" if yes_price < 0.5 else "BUY_NO"
+        else:
+            direction = "BUY_YES" if yes_price < 0.5 else "BUY_NO"
+        edge_pct = round(abs(yes_price - 0.5) * 100, 1)
 
     return {
         "score": score,
@@ -431,7 +565,7 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         "category": category,
         "market_type": market_type,
         "confidence": confidence,
-        "confirming": confirming,       # exposed so bot.py can seed its tier calculation
+        "confirming": confirming,
         "contradicting": contradicting,
         "direction": direction,
         "edge_pct": edge_pct,
@@ -452,5 +586,6 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             "vegas_implied": vegas_implied,
             "days_to_resolution": days_to_res,
             "fear_greed_signal": fear_greed_signal,
+            "market_direction": _market_direction,  # UPSIDE / DOWNSIDE
         },
     }

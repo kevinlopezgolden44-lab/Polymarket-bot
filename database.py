@@ -345,6 +345,13 @@ async def init_db(conn):
         ("vegas_gap", "FLOAT"),
         ("vegas_implied", "FLOAT"),
         ("spread", "FLOAT"),
+        ("suppressed", "BOOLEAN"),
+        ("suppression_reason", "TEXT"),
+        ("ob_imbalance", "FLOAT"),
+        ("ob_signal", "TEXT"),
+        ("volume_delta", "FLOAT"),
+        ("volume_delta_signal", "TEXT"),
+        ("market_direction", "TEXT"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -442,10 +449,13 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
                            score_breakdown, bid_price, ask_price,
                            alerts_in_last_24h, active_open_positions_count,
                            market_type, price_pct_of_range, hour_of_day_utc,
-                           direction, edge_pct, vegas_gap, vegas_implied, spread)
+                           direction, edge_pct, vegas_gap, vegas_implied, spread,
+                           suppressed, suppression_reason,
+                           ob_imbalance, ob_signal, volume_delta, volume_delta_signal,
+                           market_direction)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                 $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,$33)
+                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -472,6 +482,13 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         opportunity.get("vegas_gap"),
         opportunity.get("vegas_implied"),
         opportunity.get("spread"),
+        opportunity.get("suppressed", False),
+        opportunity.get("suppression_reason"),
+        opportunity.get("ob_imbalance"),
+        opportunity.get("ob_signal"),
+        opportunity.get("volume_delta"),
+        opportunity.get("volume_delta_signal"),
+        opportunity.get("signals", {}).get("market_direction"),
     )
 
     await conn.execute("""
@@ -572,8 +589,12 @@ async def update_open_positions(pool):
     if not open_positions:
         return []
 
-    TAKE_PROFIT_PCT = 40.0
-    STOP_LOSS_PCT   = -25.0
+    TAKE_PROFIT_PCT    = 40.0
+    STOP_LOSS_PCT      = -20.0   # Tightened from -25% — data shows avg exit was -33.8%
+                                  # so -25% wasn't executing. -20% target = ~-25% in practice.
+    TRAILING_STOP_ACTIVATE = 10.0  # Start trailing once trade is up +10%
+    TRAILING_STOP_PCT      = 15.0  # Trail at -15% from peak
+                                    # e.g. peak=+20% → stop at +5%, not -20%
 
     closed = []
     headers = {
@@ -651,6 +672,22 @@ async def update_open_positions(pool):
                         exit_reason = "STOP_LOSS"
                         outcome_type = "LOSS"
 
+                    # ── Trailing stop check ───────────────────────────────
+                    # Once a trade reaches +10%, trail at -15% from peak.
+                    # e.g. peak=+20% means stop is at +5%. Protects gains on
+                    # the 14 reversal losses that peaked at avg +14.75%.
+                    if exit_reason is None:
+                        peak_return = round((new_peak - entry) / entry * 100, 2)
+                        if peak_return >= TRAILING_STOP_ACTIVATE:
+                            trailing_stop_level = peak_return - TRAILING_STOP_PCT
+                            if return_pct <= trailing_stop_level:
+                                exit_reason = "TRAILING_STOP"
+                                outcome_type = "PARTIAL_WIN" if return_pct > 0 else "LOSS"
+                                log.info(
+                                    "Trailing stop triggered: peak=%.1f%% current=%.1f%% stop_level=%.1f%%",
+                                    peak_return, return_pct, trailing_stop_level
+                                )
+
                     if exit_reason:
                         profitable = outcome_type in ("FULL_WIN", "PARTIAL_WIN")
 
@@ -660,10 +697,12 @@ async def update_open_positions(pool):
 
                         loss_pattern = None
                         if not profitable:
-                            if exit_reason == "STOP_LOSS" and pos["peak_price"] > entry:
+                            if exit_reason in ("STOP_LOSS", "TRAILING_STOP") and pos["peak_price"] > entry:
                                 loss_pattern = "REVERSAL"
                             elif exit_reason == "STOP_LOSS":
                                 loss_pattern = "SUDDEN_DROP"
+                            elif exit_reason == "TRAILING_STOP":
+                                loss_pattern = "REVERSAL"
                             elif exit_reason == "RESOLVED":
                                 loss_pattern = "NEVER_MOVED"
 
