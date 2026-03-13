@@ -1,10 +1,8 @@
 """
 Polymarket Bot — Comprehensive Performance Diagnostic
-Run from your Railway environment or locally with DATABASE_URL set.
+Matched to actual alerts table schema.
 
-Usage:
-    python diagnostic.py                  # full report
-    python diagnostic.py --json           # output raw JSON for further processing
+Start command: python diagnostic.py
 """
 
 import asyncio
@@ -12,30 +10,23 @@ import asyncpg
 import os
 import json
 import argparse
-from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-# ─────────────────────────────────────────────
-# DB helpers
-# ─────────────────────────────────────────────
-
 async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
-
 
 async def fetch(conn, query, *args):
     return await conn.fetch(query, *args)
 
 
 # ─────────────────────────────────────────────
-# 1. Score distribution & gradient
+# 1. Score gradient
 # ─────────────────────────────────────────────
 
 async def score_gradient(conn):
-    """Do higher scores win more? Is there a meaningful gradient?"""
     rows = await fetch(conn, """
         SELECT
             CASE
@@ -48,7 +39,7 @@ async def score_gradient(conn):
             SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true
+        WHERE outcome IS NOT NULL
         GROUP BY bucket
         ORDER BY bucket DESC
     """)
@@ -68,7 +59,7 @@ async def win_rate_by_category(conn):
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return,
             ROUND(AVG(score)::numeric, 1) AS avg_score
         FROM alerts
-        WHERE resolved = true
+        WHERE outcome IS NOT NULL
         GROUP BY category
         ORDER BY total DESC
     """)
@@ -82,11 +73,11 @@ async def win_rate_by_category(conn):
 async def loss_reasons(conn):
     rows = await fetch(conn, """
         SELECT
-            loss_reason,
+            COALESCE(loss_reason, 'N/A') AS loss_reason,
             COUNT(*) AS count,
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true AND outcome = 'LOSS'
+        WHERE outcome = 'LOSS'
         GROUP BY loss_reason
         ORDER BY count DESC
     """)
@@ -94,141 +85,126 @@ async def loss_reasons(conn):
 
 
 # ─────────────────────────────────────────────
-# 4. Fear & Greed segmentation
+# 4. Fear & Greed segmentation (crypto only)
 # ─────────────────────────────────────────────
 
 async def fear_greed_buckets(conn):
-    """
-    Requires fear_greed_at_alert column. If missing, returns a warning.
-    Buckets: Extreme Fear <25, Fear 25-45, Neutral 46-54, Greed 55-75, Extreme Greed >75
-    """
-    # Check if column exists
-    col_check = await conn.fetchval("""
-        SELECT COUNT(*) FROM information_schema.columns
-        WHERE table_name = 'alerts' AND column_name = 'fear_greed_at_alert'
-    """)
-    if not col_check:
-        return {"warning": "fear_greed_at_alert column not found — add this to your alerts table for macro sentiment gating"}
-
     rows = await fetch(conn, """
         SELECT
             CASE
-                WHEN fear_greed_at_alert < 25  THEN 'Extreme Fear (<25)'
-                WHEN fear_greed_at_alert < 46  THEN 'Fear (25-45)'
-                WHEN fear_greed_at_alert < 55  THEN 'Neutral (46-54)'
-                WHEN fear_greed_at_alert < 76  THEN 'Greed (55-75)'
-                ELSE                                'Extreme Greed (>75)'
+                WHEN fear_greed_score < 25 THEN 'Extreme Fear (<25)'
+                WHEN fear_greed_score < 46 THEN 'Fear (25-45)'
+                WHEN fear_greed_score < 55 THEN 'Neutral (46-54)'
+                WHEN fear_greed_score < 76 THEN 'Greed (55-75)'
+                ELSE                            'Extreme Greed (>75)'
             END AS sentiment,
             COUNT(*) AS total,
             SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return,
-            category
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true AND category = 'Crypto'
-        GROUP BY sentiment, category
+        WHERE outcome IS NOT NULL AND category = 'Crypto'
+        GROUP BY sentiment
         ORDER BY sentiment
     """)
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# 5. Signal firing analysis
+# 5. Fear & Greed regime win rates (all categories)
+# ─────────────────────────────────────────────
+
+async def fear_greed_regime(conn):
+    rows = await fetch(conn, """
+        SELECT
+            fear_greed_regime,
+            category,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts
+        WHERE outcome IS NOT NULL AND fear_greed_regime IS NOT NULL
+        GROUP BY fear_greed_regime, category
+        ORDER BY fear_greed_regime, category
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 6. Per-signal win rates
 # ─────────────────────────────────────────────
 
 async def signal_win_rates(conn):
-    """
-    Requires signals_fired as JSONB or text array.
-    Checks which signals correlate with wins vs losses.
-    Adapt the JSON extraction to your actual schema.
-    """
-    # Check signals_fired column type
-    col_info = await conn.fetchrow("""
-        SELECT data_type FROM information_schema.columns
-        WHERE table_name = 'alerts' AND column_name = 'signals_fired'
+    rows = await fetch(conn, """
+        SELECT
+            trim(signal) AS signal,
+            COUNT(*) AS total_fired,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts,
+             unnest(string_to_array(signals_fired, ',')) AS signal
+        WHERE outcome IS NOT NULL AND signals_fired IS NOT NULL
+        GROUP BY trim(signal)
+        ORDER BY total_fired DESC
     """)
-    if not col_info:
-        return {"warning": "signals_fired column not found"}
-
-    dtype = col_info["data_type"]
-
-    # JSONB array of signal name strings
-    if dtype == "jsonb":
-        rows = await fetch(conn, """
-            SELECT
-                signal,
-                COUNT(*) AS total_fired,
-                SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
-            FROM alerts,
-                 jsonb_array_elements_text(signals_fired) AS signal
-            WHERE resolved = true
-            GROUP BY signal
-            ORDER BY total_fired DESC
-        """)
-    else:
-        # Fallback: treat as comma-separated text
-        rows = await fetch(conn, """
-            SELECT
-                trim(signal) AS signal,
-                COUNT(*) AS total_fired,
-                SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
-            FROM alerts,
-                 unnest(string_to_array(signals_fired::text, ',')) AS signal
-            WHERE resolved = true
-            GROUP BY trim(signal)
-            ORDER BY total_fired DESC
-        """)
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# 6. Direction accuracy
+# 7. Direction accuracy
 # ─────────────────────────────────────────────
 
 async def direction_accuracy(conn):
-    """WRONG_DIRECTION rate by category — key for signal tuning."""
     rows = await fetch(conn, """
         SELECT
             category,
-            COUNT(*) AS total_losses,
-            SUM(CASE WHEN loss_reason = 'WRONG_DIRECTION' THEN 1 ELSE 0 END) AS wrong_direction,
-            SUM(CASE WHEN loss_reason = 'NO_MOVEMENT'     THEN 1 ELSE 0 END) AS no_movement,
-            SUM(CASE WHEN loss_reason = 'REVERSAL'        THEN 1 ELSE 0 END) AS reversal
+            direction,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true AND outcome = 'LOSS'
-        GROUP BY category
-        ORDER BY total_losses DESC
+        WHERE outcome IS NOT NULL AND direction IS NOT NULL
+        GROUP BY category, direction
+        ORDER BY category, direction
     """)
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# 7. Time-to-resolution analysis
+# 8. Loss pattern breakdown
+# ─────────────────────────────────────────────
+
+async def loss_patterns(conn):
+    rows = await fetch(conn, """
+        SELECT
+            COALESCE(loss_pattern, 'N/A') AS loss_pattern,
+            COUNT(*) AS count,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts
+        WHERE outcome = 'LOSS'
+        GROUP BY loss_pattern
+        ORDER BY count DESC
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 9. Time-to-resolution analysis
 # ─────────────────────────────────────────────
 
 async def resolution_time_analysis(conn):
-    """Do short or long-duration markets perform better?"""
-    col_check = await conn.fetchval("""
-        SELECT COUNT(*) FROM information_schema.columns
-        WHERE table_name = 'alerts' AND column_name = 'resolution_time'
-    """)
-    if not col_check:
-        return {"warning": "resolution_time column not found — tracking market duration would improve analysis"}
-
     rows = await fetch(conn, """
         SELECT
             CASE
-                WHEN EXTRACT(EPOCH FROM (resolution_time - created_at))/3600 < 6    THEN '<6h'
-                WHEN EXTRACT(EPOCH FROM (resolution_time - created_at))/3600 < 24   THEN '6-24h'
-                WHEN EXTRACT(EPOCH FROM (resolution_time - created_at))/3600 < 168  THEN '1-7d'
+                WHEN days_to_resolution < 0.25 THEN '<6h'
+                WHEN days_to_resolution < 1    THEN '6-24h'
+                WHEN days_to_resolution < 7    THEN '1-7d'
                 ELSE '>7d'
             END AS time_bucket,
             COUNT(*) AS total,
             SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true
+        WHERE outcome IS NOT NULL AND days_to_resolution IS NOT NULL
         GROUP BY time_bucket
         ORDER BY time_bucket
     """)
@@ -236,14 +212,104 @@ async def resolution_time_analysis(conn):
 
 
 # ─────────────────────────────────────────────
-# 8. Recent trend (last 30 vs all-time)
+# 10. Vegas gap analysis
+# ─────────────────────────────────────────────
+
+async def vegas_gap_analysis(conn):
+    rows = await fetch(conn, """
+        SELECT
+            CASE
+                WHEN vegas_gap < -0.10 THEN 'Large negative (<-10%)'
+                WHEN vegas_gap < -0.05 THEN 'Moderate negative (-10 to -5%)'
+                WHEN vegas_gap < 0     THEN 'Small negative (-5 to 0%)'
+                WHEN vegas_gap < 0.05  THEN 'Small positive (0 to 5%)'
+                WHEN vegas_gap < 0.10  THEN 'Moderate positive (5-10%)'
+                ELSE                        'Large positive (>10%)'
+            END AS gap_bucket,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts
+        WHERE outcome IS NOT NULL AND vegas_gap IS NOT NULL
+        GROUP BY gap_bucket
+        ORDER BY gap_bucket
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 11. Edge pct analysis
+# ─────────────────────────────────────────────
+
+async def edge_analysis(conn):
+    rows = await fetch(conn, """
+        SELECT
+            CASE
+                WHEN edge_pct < 0.02  THEN '<2%'
+                WHEN edge_pct < 0.05  THEN '2-5%'
+                WHEN edge_pct < 0.10  THEN '5-10%'
+                WHEN edge_pct < 0.20  THEN '10-20%'
+                ELSE                       '>20%'
+            END AS edge_bucket,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts
+        WHERE outcome IS NOT NULL AND edge_pct IS NOT NULL
+        GROUP BY edge_bucket
+        ORDER BY edge_bucket
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 12. Confidence tier performance
+# ─────────────────────────────────────────────
+
+async def confidence_tier_analysis(conn):
+    rows = await fetch(conn, """
+        SELECT
+            confidence_tier,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return,
+            ROUND(AVG(score)::numeric, 1) AS avg_score
+        FROM alerts
+        WHERE outcome IS NOT NULL AND confidence_tier IS NOT NULL
+        GROUP BY confidence_tier
+        ORDER BY avg_score DESC
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 13. Hour of day performance
+# ─────────────────────────────────────────────
+
+async def hour_of_day(conn):
+    rows = await fetch(conn, """
+        SELECT
+            hour_of_day_utc,
+            COUNT(*) AS total,
+            SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+            ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
+        FROM alerts
+        WHERE outcome IS NOT NULL AND hour_of_day_utc IS NOT NULL
+        GROUP BY hour_of_day_utc
+        ORDER BY hour_of_day_utc
+    """)
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# 14. Recent trend (last 30d vs older)
 # ─────────────────────────────────────────────
 
 async def recent_vs_alltime(conn):
     rows = await fetch(conn, """
         SELECT
             CASE
-                WHEN created_at >= NOW() - INTERVAL '30 days' THEN 'Last 30d'
+                WHEN alerted_at >= NOW() - INTERVAL '30 days' THEN 'Last 30d'
                 ELSE 'Older'
             END AS period,
             COUNT(*) AS total,
@@ -251,52 +317,40 @@ async def recent_vs_alltime(conn):
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return,
             ROUND(AVG(score)::numeric, 1) AS avg_score
         FROM alerts
-        WHERE resolved = true
+        WHERE outcome IS NOT NULL
         GROUP BY period
     """)
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# 9. Initial probability edge
+# 15. Entry price / probability edge
 # ─────────────────────────────────────────────
 
-async def probability_edge(conn):
-    """
-    Are you taking positions where the market already reflects your view?
-    Ideal: alerts on markets where initial_probability is mid-range (20-80%),
-    not on near-certain outcomes.
-    """
-    col_check = await conn.fetchval("""
-        SELECT COUNT(*) FROM information_schema.columns
-        WHERE table_name = 'alerts' AND column_name = 'initial_probability'
-    """)
-    if not col_check:
-        return {"warning": "initial_probability column not found"}
-
+async def entry_price_analysis(conn):
     rows = await fetch(conn, """
         SELECT
             CASE
-                WHEN initial_probability < 0.10 THEN '<10%'
-                WHEN initial_probability < 0.25 THEN '10-25%'
-                WHEN initial_probability < 0.50 THEN '25-50%'
-                WHEN initial_probability < 0.75 THEN '50-75%'
-                WHEN initial_probability < 0.90 THEN '75-90%'
+                WHEN entry_price < 0.10 THEN '<10%'
+                WHEN entry_price < 0.25 THEN '10-25%'
+                WHEN entry_price < 0.50 THEN '25-50%'
+                WHEN entry_price < 0.75 THEN '50-75%'
+                WHEN entry_price < 0.90 THEN '75-90%'
                 ELSE '>90%'
-            END AS prob_bucket,
+            END AS price_bucket,
             COUNT(*) AS total,
             SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
             ROUND(AVG(exit_return_pct)::numeric, 2) AS avg_return
         FROM alerts
-        WHERE resolved = true
-        GROUP BY prob_bucket
-        ORDER BY prob_bucket
+        WHERE outcome IS NOT NULL AND entry_price IS NOT NULL
+        GROUP BY price_bucket
+        ORDER BY price_bucket
     """)
     return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
-# Renderer
+# Renderer helpers
 # ─────────────────────────────────────────────
 
 def pct(wins, total):
@@ -305,19 +359,27 @@ def pct(wins, total):
     return f"{round(wins / total * 100, 1)}%"
 
 def render_table(rows, columns):
-    if not rows or isinstance(rows, dict):
+    if not rows:
+        print("  (no data)")
         return
-    header = " | ".join(str(c).ljust(20) for c in columns)
+    if isinstance(rows, dict):
+        print(f"  ⚠️  {rows.get('warning', rows)}")
+        return
+    header = " | ".join(str(c).ljust(22) for c in columns)
     print(header)
     print("-" * len(header))
     for row in rows:
-        print(" | ".join(str(row.get(c, "")).ljust(20) for c in columns))
+        print(" | ".join(str(row.get(c, "")).ljust(22) for c in columns))
 
 def section(title):
-    print(f"\n{'═'*60}")
+    print(f"\n{'═'*65}")
     print(f"  {title}")
-    print(f"{'═'*60}")
+    print(f"{'═'*65}")
 
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 
 async def run_diagnostic(output_json=False):
     conn = await get_conn()
@@ -326,15 +388,13 @@ async def run_diagnostic(output_json=False):
     print("\n🔍 Polymarket Bot — Performance Diagnostic")
     print(f"   Run at: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
 
-    # 1. Score gradient
-    section("1. Score Gradient — does a higher score = higher win rate?")
+    section("1. Score Gradient — does higher score = higher win rate?")
     data = await score_gradient(conn)
     results["score_gradient"] = data
     for row in data:
         row["win_rate"] = pct(row["wins"], row["total"])
     render_table(data, ["bucket", "total", "wins", "win_rate", "avg_return"])
 
-    # 2. Category breakdown
     section("2. Win Rate by Category")
     data = await win_rate_by_category(conn)
     results["by_category"] = data
@@ -342,71 +402,92 @@ async def run_diagnostic(output_json=False):
         row["win_rate"] = pct(row["wins"], row["total"])
     render_table(data, ["category", "total", "wins", "win_rate", "avg_return", "avg_score"])
 
-    # 3. Loss reasons
     section("3. Loss Reason Breakdown")
     data = await loss_reasons(conn)
     results["loss_reasons"] = data
     render_table(data, ["loss_reason", "count", "avg_return"])
 
-    # 4. Fear & Greed
-    section("4. Crypto Win Rate by Fear & Greed Bucket")
-    data = await fear_greed_buckets(conn)
-    results["fear_greed"] = data
-    if isinstance(data, dict) and "warning" in data:
-        print(f"  ⚠️  {data['warning']}")
-    else:
-        for row in data:
-            row["win_rate"] = pct(row["wins"], row["total"])
-        render_table(data, ["sentiment", "total", "wins", "win_rate", "avg_return"])
+    section("4. Loss Pattern Breakdown")
+    data = await loss_patterns(conn)
+    results["loss_patterns"] = data
+    render_table(data, ["loss_pattern", "count", "avg_return"])
 
-    # 5. Signal win rates
-    section("5. Per-Signal Win Rates")
+    section("5. Crypto Win Rate by Fear & Greed Score Bucket")
+    data = await fear_greed_buckets(conn)
+    results["fear_greed_buckets"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["sentiment", "total", "wins", "win_rate", "avg_return"])
+
+    section("6. Win Rate by Fear & Greed Regime (All Categories)")
+    data = await fear_greed_regime(conn)
+    results["fear_greed_regime"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["fear_greed_regime", "category", "total", "wins", "win_rate", "avg_return"])
+
+    section("7. Per-Signal Win Rates")
     data = await signal_win_rates(conn)
     results["signals"] = data
-    if isinstance(data, dict) and "warning" in data:
-        print(f"  ⚠️  {data['warning']}")
-    else:
-        for row in data:
-            row["win_rate"] = pct(row["wins"], row["total_fired"])
-        render_table(data, ["signal", "total_fired", "wins", "win_rate", "avg_return"])
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total_fired"])
+    render_table(data, ["signal", "total_fired", "wins", "win_rate", "avg_return"])
 
-    # 6. Direction accuracy
-    section("6. Direction Accuracy by Category")
+    section("8. Direction Accuracy by Category")
     data = await direction_accuracy(conn)
     results["direction"] = data
     for row in data:
-        row["wrong_dir_pct"] = pct(row["wrong_direction"], row["total_losses"])
-    render_table(data, ["category", "total_losses", "wrong_direction", "wrong_dir_pct", "no_movement", "reversal"])
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["category", "direction", "total", "wins", "win_rate", "avg_return"])
 
-    # 7. Resolution time
-    section("7. Win Rate by Time-to-Resolution")
+    section("9. Win Rate by Time-to-Resolution")
     data = await resolution_time_analysis(conn)
     results["resolution_time"] = data
-    if isinstance(data, dict) and "warning" in data:
-        print(f"  ⚠️  {data['warning']}")
-    else:
-        for row in data:
-            row["win_rate"] = pct(row["wins"], row["total"])
-        render_table(data, ["time_bucket", "total", "wins", "win_rate", "avg_return"])
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["time_bucket", "total", "wins", "win_rate", "avg_return"])
 
-    # 8. Recent vs all-time
-    section("8. Recent Trend (Last 30d vs Older)")
+    section("10. Vegas Gap Analysis")
+    data = await vegas_gap_analysis(conn)
+    results["vegas_gap"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["gap_bucket", "total", "wins", "win_rate", "avg_return"])
+
+    section("11. Edge Pct Analysis")
+    data = await edge_analysis(conn)
+    results["edge"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["edge_bucket", "total", "wins", "win_rate", "avg_return"])
+
+    section("12. Confidence Tier Performance")
+    data = await confidence_tier_analysis(conn)
+    results["confidence_tier"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["confidence_tier", "total", "wins", "win_rate", "avg_return", "avg_score"])
+
+    section("13. Hour of Day Performance (UTC)")
+    data = await hour_of_day(conn)
+    results["hour_of_day"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["hour_of_day_utc", "total", "wins", "win_rate", "avg_return"])
+
+    section("14. Recent Trend — Last 30d vs Older")
     data = await recent_vs_alltime(conn)
     results["trend"] = data
     for row in data:
         row["win_rate"] = pct(row["wins"], row["total"])
     render_table(data, ["period", "total", "wins", "win_rate", "avg_return", "avg_score"])
 
-    # 9. Probability edge
-    section("9. Win Rate by Initial Market Probability")
-    data = await probability_edge(conn)
-    results["probability_edge"] = data
-    if isinstance(data, dict) and "warning" in data:
-        print(f"  ⚠️  {data['warning']}")
-    else:
-        for row in data:
-            row["win_rate"] = pct(row["wins"], row["total"])
-        render_table(data, ["prob_bucket", "total", "wins", "win_rate", "avg_return"])
+    section("15. Entry Price (Probability) Buckets")
+    data = await entry_price_analysis(conn)
+    results["entry_price"] = data
+    for row in data:
+        row["win_rate"] = pct(row["wins"], row["total"])
+    render_table(data, ["price_bucket", "total", "wins", "win_rate", "avg_return"])
 
     await conn.close()
 
@@ -414,13 +495,21 @@ async def run_diagnostic(output_json=False):
         print("\n\n--- JSON OUTPUT ---")
         print(json.dumps(results, indent=2, default=str))
 
-    print("\n✅ Diagnostic complete.\n")
-    print("Next steps:")
-    print("  • Any section with <20% win rate is a suppression candidate")
-    print("  • If signals section shows one signal always loses → zero its weight")
-    print("  • If fear_greed <25 shows 0% win rate → add macro gate to scoring.py")
-    print("  • If wrong_dir_pct > 50% in a category → direction logic needs work")
-    print("  • Columns marked ⚠️  missing → add them to your alerts table for richer analysis")
+    print(f"\n{'═'*65}")
+    print("  ✅ Diagnostic complete")
+    print(f"{'═'*65}")
+    print("""
+Key things to act on:
+  • Score gradient flat?          → scoring weights aren't discriminating
+  • Signal win rate <15%?         → zero out that signal's weight
+  • Fear regime Extreme Fear low? → add hard gate in scoring.py
+  • Direction <40% win rate?      → direction logic broken for that category
+  • Vegas gap sweet spot?         → tighten entry filter to that range
+  • Edge <2% always loses?        → raise minimum edge threshold
+  • Confidence tier flat?         → tier thresholds need recalibration
+  • Specific hours losing bad?    → add time-of-day filter
+  • Entry price >75% losing?      → avoid near-certain markets (no edge)
+""")
 
 
 if __name__ == "__main__":
