@@ -328,45 +328,19 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         confirming += 1
 
     # ── Price momentum ─────────────────────────────────────────────────────────
-    # Direction-aware: for DOWNSIDE markets, falling price = moving toward target.
     momentum = analyze_price_momentum(price_history_rows)
-    if _market_direction == "DOWNSIDE":
-        if momentum["signal"] in ("STRONG_FALLING", "FALLING"):
-            score += 15
-            confirming += 1
-            flags.append("MOMENTUM: price falling — toward downside target")
-        elif momentum["signal"] in ("STRONG_RISING", "RISING"):
-            score -= 10
-            contradicting += 1
-            flags.append("MOMENTUM: price rising — away from downside target")
-    else:
-        if momentum["signal"] in ("STRONG_RISING", "RISING"):
-            score += 15
-            confirming += 1
-        elif momentum["signal"] in ("STRONG_FALLING", "FALLING"):
-            score -= 10
-            contradicting += 1
+    if momentum["signal"] in ("STRONG_RISING", "RISING"):
+        score += 15
+        confirming += 1
+    elif momentum["signal"] in ("STRONG_FALLING", "FALLING"):
+        score -= 10
+        contradicting += 1
 
     # ── Price velocity ─────────────────────────────────────────────────────────
-    # Direction-aware: fast move DOWN on a DOWNSIDE market is confirming.
-    # Fast move UP on a DOWNSIDE market is contradicting.
     velocity = analyze_price_velocity(price_history_rows)
     if velocity["fast_move"]:
-        move_up = velocity["change"] > 0
-        if _market_direction == "DOWNSIDE":
-            if not move_up:
-                score += 10
-                confirming += 1
-            else:
-                score -= 5
-                contradicting += 1
-        else:
-            if move_up:
-                score += 10
-                confirming += 1
-            else:
-                score -= 5
-                contradicting += 1
+        score += 10
+        confirming += 1
         if velocity["alert"]:
             flags.append(velocity["alert"])
 
@@ -463,17 +437,9 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             days_to_res = round((end_dt - now()).total_seconds() / 86400, 1)
             if days_to_res is not None:
                 if days_to_res <= 3:
-                    # Only a bonus if there is genuine price movement possible.
-                    # A market at 4 cents resolving in 12h is decaying — not efficient.
-                    # Require yes_price > 0.20 to count as capital efficient.
-                    if yes_price >= 0.20:
-                        score += 10
-                        confirming += 1
-                        flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
-                    else:
-                        score -= 5
-                        contradicting += 1
-                        flags.append(f"RESOLVES SOON: {days_to_res}d — but low price suggests decaying market")
+                    score += 10
+                    confirming += 1
+                    flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
                 elif days_to_res <= 14:
                     score += 5   # mild bonus
                 elif days_to_res > 180:
@@ -502,13 +468,9 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             flags.append("SPORTS: no Vegas gap signal — capped at 70, not alerting")
 
     # ── Time-of-day gate ───────────────────────────────────────────────────────
-    # Diagnostic shows hours 7-11 UTC and 17-19 UTC have 40-66% win rates.
-    # Hours 0-6, 12-16, 19-23 UTC are mostly losing. Cap score outside window.
-    hour_utc = now().hour
-    good_hours = set(range(7, 12)) | {17, 18, 19}
-    if hour_utc not in good_hours:
-        score = min(score, 70)
-        flags.append(f"TIME GATE: hour {hour_utc} UTC outside winning window (7-11, 17-19) — capped at 70")
+    # Removed: sample size too small (< 3 trades/hour on avg) to trust hourly
+    # win rates. Will re-enable once 300+ resolved trades available.
+    # hour_utc logged via hour_of_day_utc column for future analysis.
 
     # ── Clamp score ────────────────────────────────────────────────────────────
     score = max(0, min(100, score))
