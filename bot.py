@@ -102,6 +102,18 @@ SOCIAL_COUNT_PATTERN = re.compile(
     r'(post|tweet|share) \d+[\-+]\d* (tweet|post|time|x post|message)',
     re.IGNORECASE
 )
+# Word count markets e.g. "Will Powell say inflation 50+ times?"
+# Requires real-time transcript analysis to trade — no edge from price signals.
+# Also catches bucket markets like "say inflation 40-49 times" where only
+# one bucket resolves YES, making all others guaranteed losses.
+WORD_COUNT_PATTERN = re.compile(
+    r"(say|mention|use|utter|repeat|reference).{1,40}\d+\+?\s*(times|time)",
+    re.IGNORECASE
+)
+WORD_COUNT_KEYWORDS = [
+    "times during", "times in the", "times on", "times at",
+    "or more times", "or fewer times", "at least",
+]
 SHORT_WINDOW_KEYWORDS = ["up or down", "pump or dump", "higher or lower", "above or below"]
 OVER_UNDER_KEYWORDS   = ["o/u ", ": o/u", "over/under", "total points", "total runs", "total goals"]
 FUTURES_KEYWORDS = [
@@ -287,14 +299,20 @@ def _should_skip_market(question_lower):
     # Only one bucket can resolve YES — guaranteed losses on all others
     if SOCIAL_COUNT_PATTERN.search(question_lower):
         return True
+    # Word count markets e.g. "Will Powell say inflation 50+ times?"
+    # No edge without real-time transcript data — skip entirely
+    if WORD_COUNT_PATTERN.search(question_lower):
+        return True
+    if any(kw in question_lower for kw in WORD_COUNT_KEYWORDS):
+        return True
     return False
 
 
 async def main():
     log.info("=" * 50)
-    log.info("Polymarket Bot v16 Starting...")
-    log.info("Change: Connection pooling (asyncpg.create_pool)")
-    log.info("Change: Vegas gap now wired into score_opportunity")
+    log.info("Polymarket Bot v17 Starting...")
+    log.info("Change: Word count market skip filter added")
+    log.info("Change: Cross-market consistency extended to threshold markets")
     log.info("=" * 50)
 
     # ── CONNECTION POOL ────────────────────────────────────────────────────────

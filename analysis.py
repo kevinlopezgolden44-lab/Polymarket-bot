@@ -122,7 +122,11 @@ def analyze_liquidity(market):
 def check_cross_market_consistency(market, all_markets):
     """
     Detects logical price inconsistencies between related markets.
-    e.g. BTC reaching $90k should always be <= probability of BTC reaching $85k.
+
+    Handles two market types:
+    1. Price targets: BTC reaching $90k should be <= probability of BTC reaching $85k
+    2. Threshold counts: "say X 50+ times" should be <= probability of "say X 40+ times"
+       because if 50+ is true, 40+ must also be true.
     """
     question = market.get("question", "").lower()
     inconsistencies = []
@@ -136,70 +140,123 @@ def check_cross_market_consistency(market, all_markets):
             return inconsistencies
         yes_price = float(outcomes[0])
 
-        # Find price targets in this market
-        numbers = re.findall(r"\$[\d,]+", question)
-        if not numbers:
-            return inconsistencies
-        this_target = float(numbers[0].replace("$", "").replace(",", ""))
+        # ── Type 1: Price target markets ──────────────────────────────────────
+        numbers_dollar = re.findall(r"\$[\d,]+", question)
+        if numbers_dollar:
+            this_target = float(numbers_dollar[0].replace("$", "").replace(",", ""))
 
-        # Determine if this is upside or downside target
-        is_upside = any(w in question for w in ["reach", "above", "exceed", "hit", "top"])
-        is_downside = any(w in question for w in ["dip", "below", "drop", "fall", "bottom"])
+            is_upside = any(w in question for w in ["reach", "above", "exceed", "hit", "top"])
+            is_downside = any(w in question for w in ["dip", "below", "drop", "fall", "bottom"])
 
-        if not is_upside and not is_downside:
-            return inconsistencies
+            if is_upside or is_downside:
+                for other in all_markets:
+                    try:
+                        other_q = other.get("question", "").lower()
+                        if other_q == question:
+                            continue
+                        same_asset = False
+                        for asset in ["bitcoin", "btc", "ethereum", "eth", "solana"]:
+                            if asset in question and asset in other_q:
+                                same_asset = True
+                                break
+                        if not same_asset:
+                            continue
 
-        # Find related markets with similar questions
-        for other in all_markets:  # scan all markets passed in
-            try:
-                other_q = other.get("question", "").lower()
-                if other_q == question:
-                    continue
-                # Must be same asset type
-                same_asset = False
-                for asset in ["bitcoin", "btc", "ethereum", "eth", "solana"]:
-                    if asset in question and asset in other_q:
-                        same_asset = True
-                        break
-                if not same_asset:
-                    continue
+                        other_outcomes = other.get("outcomePrices", "[]")
+                        if isinstance(other_outcomes, str):
+                            import json
+                            other_outcomes = json.loads(other_outcomes)
+                        if not other_outcomes:
+                            continue
+                        other_price = float(other_outcomes[0])
 
-                other_outcomes = other.get("outcomePrices", "[]")
-                if isinstance(other_outcomes, str):
-                    import json
-                    other_outcomes = json.loads(other_outcomes)
-                if not other_outcomes:
-                    continue
-                other_price = float(other_outcomes[0])
+                        other_numbers = re.findall(r"\$[\d,]+", other_q)
+                        if not other_numbers:
+                            continue
+                        other_target = float(other_numbers[0].replace("$", "").replace(",", ""))
 
-                other_numbers = re.findall(r"\$[\d,]+", other_q)
-                if not other_numbers:
-                    continue
-                other_target = float(other_numbers[0].replace("$", "").replace(",", ""))
+                        if is_upside:
+                            other_is_upside = any(w in other_q for w in ["reach", "above", "exceed", "hit"])
+                            if other_is_upside and other_target < this_target and other_price < yes_price:
+                                inconsistencies.append(
+                                    "Inconsistency: $" + str(round(other_target)) +
+                                    " target priced lower than $" + str(round(this_target)) + " target"
+                                )
+                        if is_downside:
+                            other_is_downside = any(w in other_q for w in ["dip", "below", "drop", "fall"])
+                            if other_is_downside and other_target > this_target and other_price < yes_price:
+                                inconsistencies.append(
+                                    "Inconsistency: $" + str(round(other_target)) +
+                                    " dip target priced lower than $" + str(round(this_target)) + " target"
+                                )
+                    except Exception as e:
+                        log.warning("cross_market price inner loop error: %s", e)
+                        continue
 
-                # For upside: higher target should have lower or equal probability
-                if is_upside:
-                    other_is_upside = any(w in other_q for w in ["reach", "above", "exceed", "hit"])
-                    if other_is_upside and other_target < this_target and other_price < yes_price:
-                        inconsistencies.append(
-                            "Inconsistency: $" + str(round(other_target)) +
-                            " target priced lower than $" + str(round(this_target)) + " target"
+        # ── Type 2: Threshold count markets ───────────────────────────────────
+        # "Will X say Y 50+ times" — if 50+ resolves YES, then 40+ must also.
+        # So P(50+) <= P(40+). If market prices it the other way, flag it.
+        # Pattern: extract the numeric threshold from "N+ times" or "N or more times"
+        threshold_match = re.search(r"(\d+)\+?\s*(?:or more\s+)?times", question)
+        if threshold_match:
+            this_threshold = int(threshold_match.group(1))
+
+            # Extract the subject being counted (word before "times")
+            # e.g. "say inflation" from "will powell say inflation 50+ times"
+            subject_match = re.search(
+                r"(say|mention|use|utter)\s+([a-z\s]{2,30}?)\s+\d+", question
+            )
+            this_subject = subject_match.group(2).strip() if subject_match else None
+
+            if this_subject:
+                for other in all_markets:
+                    try:
+                        other_q = other.get("question", "").lower()
+                        if other_q == question:
+                            continue
+
+                        # Must mention same subject
+                        if this_subject not in other_q:
+                            continue
+
+                        other_threshold_match = re.search(
+                            r"(\d+)\+?\s*(?:or more\s+)?times", other_q
                         )
-                # For downside: lower target should have lower or equal probability
-                if is_downside:
-                    other_is_downside = any(w in other_q for w in ["dip", "below", "drop", "fall"])
-                    if other_is_downside and other_target > this_target and other_price < yes_price:
-                        inconsistencies.append(
-                            "Inconsistency: $" + str(round(other_target)) +
-                            " dip target priced lower than $" + str(round(this_target)) + " target"
-                        )
-            except Exception as e:
-                log.warning("cross_market inner loop error: %s", e)
-                continue
+                        if not other_threshold_match:
+                            continue
+                        other_threshold = int(other_threshold_match.group(1))
+
+                        other_outcomes = other.get("outcomePrices", "[]")
+                        if isinstance(other_outcomes, str):
+                            import json
+                            other_outcomes = json.loads(other_outcomes)
+                        if not other_outcomes:
+                            continue
+                        other_price = float(other_outcomes[0])
+
+                        # Higher threshold must have lower or equal probability
+                        # If this market has higher threshold but higher price — inconsistency
+                        if this_threshold > other_threshold and yes_price > other_price:
+                            inconsistencies.append(
+                                f"Inconsistency: {this_threshold}+ times priced higher than "
+                                f"{other_threshold}+ times — impossible if {other_threshold}+ is necessary for {this_threshold}+"
+                            )
+                        # Lower threshold must have higher or equal probability
+                        elif this_threshold < other_threshold and yes_price < other_price:
+                            inconsistencies.append(
+                                f"Inconsistency: {this_threshold}+ times priced lower than "
+                                f"{other_threshold}+ times — {this_threshold}+ should be more likely"
+                            )
+
+                    except Exception as e:
+                        log.warning("cross_market threshold inner loop error: %s", e)
+                        continue
+
     except Exception as e:
         log.warning("check_cross_market_consistency error: %s", e)
 
     return inconsistencies[:2]  # Return max 2 inconsistencies
+
 
 # ── 5. POLYMARKET LAG DETECTION ────────────────────────────────────────────────
 def detect_polymarket_lag(question, yes_price, crypto_data):
