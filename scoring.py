@@ -329,6 +329,11 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         confirming += 1
 
     # ── Price momentum ─────────────────────────────────────────────────────────
+    # Tracks YES token price movement — direction-neutral.
+    # Rising YES token = market pricing outcome as more likely = confirming.
+    # Falling YES token = market pricing outcome as less likely = contradicting.
+    # This applies equally to UPSIDE and DOWNSIDE markets since we track the
+    # YES token itself, not the underlying asset price.
     momentum = analyze_price_momentum(price_history_rows)
     if momentum["signal"] in ("STRONG_RISING", "RISING"):
         score += 15
@@ -338,6 +343,9 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         contradicting += 1
 
     # ── Price velocity ─────────────────────────────────────────────────────────
+    # Tracks YES token price velocity — direction-neutral.
+    # Fast move in YES token = genuine market interest = confirming regardless
+    # of direction, since we track the token not the underlying asset.
     velocity = analyze_price_velocity(price_history_rows)
     if velocity["fast_move"]:
         score += 10
@@ -506,9 +514,14 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             days_to_res = round((end_dt - now()).total_seconds() / 86400, 1)
             if days_to_res is not None:
                 if days_to_res <= 3:
-                    score += 10
-                    confirming += 1
-                    flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
+                    if yes_price >= 0.20:
+                        score += 10
+                        confirming += 1
+                        flags.append(f"RESOLVES SOON: {days_to_res}d — high capital efficiency")
+                    else:
+                        score -= 5
+                        contradicting += 1
+                        flags.append(f"RESOLVES SOON: {days_to_res}d — but low price suggests decaying market")
                 elif days_to_res <= 14:
                     score += 5   # mild bonus
                 elif days_to_res > 180:
