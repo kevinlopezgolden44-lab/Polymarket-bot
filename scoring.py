@@ -20,6 +20,7 @@ from analysis import (
     analyze_event_timing,
     check_resolution_ambiguity,
     calculate_confidence_tier,
+    check_resolution_sanity,
 )
 
 # ── 9. CATEGORY DETECTION ─────────────────────────────────────────────────────
@@ -173,7 +174,7 @@ def detect_market_type(question):
 # ── 12. SCORE OPPORTUNITY ─────────────────────────────────────────────────────
 def score_opportunity(market, price_history_rows=None, all_markets=None,
                       crypto_data=None, upcoming_events=None, fear_greed=None,
-                      sports_odds=None):
+                      sports_odds=None, funding_rate=None, clob_data=None):
     """
     Master scoring function. Aggregates all signals into a 0-100 score.
 
@@ -365,6 +366,74 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     if lag:
         flags.append(f"LAG_DETECTED (unscored): {lag}")
 
+    # ── Binance funding rate (Crypto) ─────────────────────────────────────────────
+    # Funding rate tells us whether futures traders are overcrowded on one side.
+    # Strong negative funding = shorts overcrowded = potential squeeze = upside likely
+    # Strong positive funding = longs overcrowded = potential dump = downside likely
+    # Applied direction-aware: signal is flipped for DOWNSIDE markets.
+    funding_signal = None
+    if category == "Crypto" and funding_rate and funding_rate.get("success"):
+        fr_signal = funding_rate.get("signal", "NEUTRAL")
+        fr_bonus = funding_rate.get("score_bonus", 0)
+        funding_signal = fr_signal
+
+        if fr_signal != "NEUTRAL" and fr_bonus > 0:
+            if _market_direction == "DOWNSIDE":
+                # LONGS_OVERCROWDED = dump likely = downside target more likely = YES
+                # SHORTS_OVERCROWDED = squeeze likely = downside target less likely = NO
+                if fr_signal in ("LONGS_OVERCROWDED", "MILD_BULLISH_FUNDING"):
+                    score += fr_bonus
+                    confirming += 1
+                    flags.append(f"FUNDING: {fr_signal} ({funding_rate['rate_pct']}%) — longs overcrowded, downside likely")
+                elif fr_signal in ("SHORTS_OVERCROWDED", "MILD_BEARISH_FUNDING"):
+                    score -= fr_bonus
+                    contradicting += 1
+                    flags.append(f"FUNDING: {fr_signal} ({funding_rate['rate_pct']}%) — shorts overcrowded, squeeze risk")
+            else:
+                # UPSIDE market
+                # SHORTS_OVERCROWDED = squeeze likely = upside more likely = YES
+                # LONGS_OVERCROWDED = dump likely = upside less likely = NO
+                if fr_signal in ("SHORTS_OVERCROWDED", "MILD_BEARISH_FUNDING"):
+                    score += fr_bonus
+                    confirming += 1
+                    flags.append(f"FUNDING: {fr_signal} ({funding_rate['rate_pct']}%) — shorts overcrowded, squeeze potential")
+                elif fr_signal in ("LONGS_OVERCROWDED", "MILD_BULLISH_FUNDING"):
+                    score -= fr_bonus
+                    contradicting += 1
+                    flags.append(f"FUNDING: {fr_signal} ({funding_rate['rate_pct']}%) — longs overcrowded, dump risk")
+
+    # ── CLOB order book imbalance (all categories) ─────────────────────────────
+    # Real bid/ask size imbalance from Polymarket CLOB — more accurate than
+    # the price-distance proxy used in bot.py.
+    # Replaces the proxy OB signal with real data when available.
+    clob_signal = None
+    if clob_data and clob_data.get("success"):
+        clob_signal = clob_data.get("signal", "BALANCED")
+        clob_bonus = clob_data.get("score_bonus", 0)
+        imbalance = clob_data.get("imbalance", 0)
+
+        if clob_signal != "BALANCED" and clob_bonus > 0:
+            if _market_direction == "DOWNSIDE":
+                # Sell pressure = more asks = market expects price to fall = YES for downside
+                if clob_signal in ("STRONG_SELL_PRESSURE", "SELL_PRESSURE"):
+                    score += clob_bonus
+                    confirming += 1
+                    flags.append(f"CLOB: {clob_signal} (imbalance={imbalance}) — sell pressure confirms downside")
+                elif clob_signal in ("STRONG_BUY_PRESSURE", "BUY_PRESSURE"):
+                    score -= clob_bonus
+                    contradicting += 1
+                    flags.append(f"CLOB: {clob_signal} (imbalance={imbalance}) — buy pressure contradicts downside")
+            else:
+                # UPSIDE market
+                if clob_signal in ("STRONG_BUY_PRESSURE", "BUY_PRESSURE"):
+                    score += clob_bonus
+                    confirming += 1
+                    flags.append(f"CLOB: {clob_signal} (imbalance={imbalance}) — buy pressure confirms upside")
+                elif clob_signal in ("STRONG_SELL_PRESSURE", "SELL_PRESSURE"):
+                    score -= clob_bonus
+                    contradicting += 1
+                    flags.append(f"CLOB: {clob_signal} (imbalance={imbalance}) — sell pressure contradicts upside")
+
     # ── Vegas divergence (Sports) ──────────────────────────────────────────────
     # Compare Vegas implied probability to Polymarket price.
     # A gap > 10% is genuine edge — the two most liquid prediction markets disagree.
@@ -450,6 +519,26 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
                     score -= 5
         except Exception:
             pass
+
+    # ── Resolution sanity check (Crypto price targets) ───────────────────────────
+    # Penalises markets where the required price move is implausible given the
+    # time remaining. e.g. ETH needs -7% in 12h = unrealistic = score penalty.
+    # Only runs on Crypto markets with a current price available.
+    sanity = None
+    if category == "Crypto" and days_to_res is not None:
+        crypto_data_for_sanity = None
+        # Use the crypto_data passed into score_opportunity if available
+        if crypto_data and crypto_data.get("success"):
+            crypto_data_for_sanity = crypto_data
+        sanity = check_resolution_sanity(
+            question, yes_price,
+            crypto_data=crypto_data_for_sanity,
+            days_to_resolution=days_to_res
+        )
+        if sanity:
+            score -= sanity["penalty"]
+            contradicting += 1
+            flags.append(sanity["reason"])
 
     # ── Market age bonus ───────────────────────────────────────────────────────
     age_hours = get_market_age_hours(market)
@@ -549,5 +638,7 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             "days_to_resolution": days_to_res,
             "fear_greed_signal": fear_greed_signal,
             "market_direction": _market_direction,  # UPSIDE / DOWNSIDE
+            "funding_signal": funding_signal,
+            "clob_signal": clob_signal,
         },
     }

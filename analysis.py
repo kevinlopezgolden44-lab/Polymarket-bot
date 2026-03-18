@@ -8,16 +8,28 @@ def now():
     return datetime.utcnow()
 
 # ── 1. PRICE MOMENTUM ──────────────────────────────────────────────────────────
-def analyze_price_momentum(price_history_rows):
+def analyze_price_momentum(price_history_rows, recency_hours=72):
     """
-    Returns momentum signal based on price history.
-    Positive = price rising (YES getting more likely)
-    Negative = price falling (YES getting less likely)
+    Returns momentum signal based on recent price history.
+
+    recency_hours=72: only uses data from the last 72 hours.
+    This prevents stale momentum from firing — a market that rose 3 weeks ago
+    and has been flat since should not score as RISING.
+
+    Price history is recorded every ~2h, so 72h = ~36 data points max.
+    Falls back to all available history if insufficient recent data.
     """
     if not price_history_rows or len(price_history_rows) < 2:
         return {"signal": "INSUFFICIENT_DATA", "change": 0, "direction": "UNKNOWN"}
 
-    prices = [float(r["yes_price"]) for r in reversed(price_history_rows)]
+    # Filter to recent window
+    cutoff = now() - timedelta(hours=recency_hours)
+    recent_rows = [r for r in price_history_rows if r["recorded_at"] > cutoff]
+
+    # Fall back to all history if not enough recent points
+    rows_to_use = recent_rows if len(recent_rows) >= 2 else price_history_rows
+
+    prices = [float(r["yes_price"]) for r in reversed(rows_to_use)]
     oldest = prices[0]
     newest = prices[-1]
 
@@ -38,7 +50,8 @@ def analyze_price_momentum(price_history_rows):
         signal = "STABLE"
 
     direction = "UP" if change_pct > 0 else "DOWN" if change_pct < 0 else "FLAT"
-    return {"signal": signal, "change": change_pct, "direction": direction}
+    return {"signal": signal, "change": change_pct, "direction": direction,
+            "recency_hours": recency_hours, "points_used": len(rows_to_use)}
 
 # ── 2. PRICE VELOCITY ──────────────────────────────────────────────────────────
 def analyze_price_velocity(price_history_rows, window_hours=1):
@@ -277,19 +290,102 @@ def check_resolution_ambiguity(question):
 
     return None
 
-# ── 8. CONFIDENCE TIER ─────────────────────────────────────────────────────────
+# ── 8. RESOLUTION SANITY CHECK ────────────────────────────────────────────────
+def check_resolution_sanity(question, yes_price, crypto_data=None, days_to_resolution=None):
+    """
+    Checks whether the required price move is plausible given time remaining.
+
+    For crypto price target markets:
+    - Extracts target price from question
+    - Compares to current price to get required move %
+    - Checks if that move is realistic in the time available
+
+    Returns a penalty score and reason if the move is implausible.
+    Returns None if the market passes sanity check or can't be evaluated.
+
+    Rough plausibility thresholds (crypto, based on historical volatility):
+      <6h:   max realistic move ~3%
+      <24h:  max realistic move ~8%
+      <3d:   max realistic move ~15%
+      <7d:   max realistic move ~25%
+      >7d:   no cap — anything plausible over weeks
+    """
+    if not crypto_data or not crypto_data.get("success"):
+        return None
+    if days_to_resolution is None:
+        return None
+
+    current_price = crypto_data.get("price", 0)
+    if not current_price:
+        return None
+
+    # Extract target price from question
+    numbers = re.findall(r"\$[\d,]+", question)
+    if not numbers:
+        return None
+
+    try:
+        target = float(numbers[0].replace("$", "").replace(",", ""))
+        required_move_pct = abs((target - current_price) / current_price * 100)
+
+        # Plausibility thresholds
+        if days_to_resolution < 0.25:      # under 6 hours
+            max_realistic = 3.0
+        elif days_to_resolution < 1:       # under 24 hours
+            max_realistic = 8.0
+        elif days_to_resolution < 3:       # under 3 days
+            max_realistic = 15.0
+        elif days_to_resolution < 7:       # under 7 days
+            max_realistic = 25.0
+        else:
+            return None  # longer markets — no cap
+
+        if required_move_pct > max_realistic * 2:
+            # Move is more than 2x the realistic threshold — strong penalty
+            return {
+                "penalty": 20,
+                "reason": (
+                    f"SANITY: requires {round(required_move_pct, 1)}% move in "
+                    f"{round(days_to_resolution * 24, 1)}h — max realistic ~{max_realistic}%"
+                ),
+                "required_move_pct": required_move_pct,
+                "max_realistic": max_realistic,
+            }
+        elif required_move_pct > max_realistic:
+            # Move is above threshold but not wildly so — mild penalty
+            return {
+                "penalty": 10,
+                "reason": (
+                    f"SANITY: requires {round(required_move_pct, 1)}% move in "
+                    f"{round(days_to_resolution * 24, 1)}h — slightly above realistic range"
+                ),
+                "required_move_pct": required_move_pct,
+                "max_realistic": max_realistic,
+            }
+
+    except Exception as e:
+        log.warning("check_resolution_sanity error: %s", e)
+
+    return None
+
+
+# ── 9. CONFIDENCE TIER ─────────────────────────────────────────────────────────
 def calculate_confidence_tier(score, confirming_signals, contradicting_signals):
     """
-    Assigns confidence tier based on how many signals agree.
-    High = 3+ confirming signals, 0 contradictions
-    Medium = 2 confirming, <=1 contradiction
-    Low = 1 confirming or any contradictions
-    """
-    net_signals = confirming_signals - (contradicting_signals * 2)
+    Assigns confidence tier based on signal quality and contradictions.
 
-    if score >= 85 and net_signals >= 2:
+    Diagnostic showed the old tier was INVERTED — HIGH confidence had 14% win rate
+    vs LOW at 37%. Root cause: HIGH fired whenever score>=85 AND net_signals>=2,
+    which was almost every alert since signals are additive. Rebuilt to penalise
+    contradictions more heavily and require genuine signal separation.
+
+    HIGH   = score >= 90, 3+ confirming, 0 contradictions
+    MEDIUM = score >= 85, 2+ confirming, <=1 contradiction
+    LOW    = everything else
+    """
+    if contradicting_signals == 0 and confirming_signals >= 3 and score >= 90:
         return "HIGH"
-    elif score >= 70 and net_signals >= 1:
+    elif contradicting_signals <= 1 and confirming_signals >= 2 and score >= 85:
         return "MEDIUM"
     else:
         return "LOW"

@@ -22,6 +22,7 @@ from research import (
     prefetch_all_crypto, get_sports_odds,
     prefetch_sports_odds, detect_sport_key, FUTURES_ONLY_SPORT_KEYS,
     load_sports_quota_state,
+    get_funding_rate, prefetch_funding_rates, get_clob_order_book,
 )
 from analysis import (
     analyze_price_momentum, analyze_price_velocity,
@@ -431,6 +432,7 @@ async def main():
 
             # ── Pre-fetch data before scan ─────────────────────────────────────
             await prefetch_all_crypto()
+            await prefetch_funding_rates()   # Binance funding rates — free, no key
 
             async with pool.acquire() as conn:
                 upcoming_events = await load_upcoming_events(conn)
@@ -544,13 +546,37 @@ async def main():
                         except Exception as e:
                             log.warning("Sports odds lookup error: %s", e)
 
+                    # ── Fetch CLOB order book (real bid/ask sizes) ─────────────
+                    _clob_data = None
+                    if category == "Crypto":
+                        try:
+                            clob_token_ids = market.get("clobTokenIds")
+                            if isinstance(clob_token_ids, str):
+                                import json as _j
+                                clob_token_ids = _j.loads(clob_token_ids)
+                            if clob_token_ids:
+                                _token_id = clob_token_ids[0]  # YES token
+                                _clob_data = await get_clob_order_book(str(_token_id))
+                        except Exception as _e:
+                            log.debug("CLOB fetch error: %s", _e)
+
+                    # ── Funding rate (from prefetch cache — instant) ────────────
+                    _funding_data = None
+                    if category == "Crypto":
+                        try:
+                            _funding_data = await get_funding_rate(market.get("question", ""))
+                        except Exception as _e:
+                            log.debug("Funding rate fetch error: %s", _e)
+
                     result = score_opportunity(
                         market,
                         price_history_rows=_history_pre,
                         all_markets=active_markets,
                         upcoming_events=upcoming_events,
                         fear_greed=fear_greed,
-                        sports_odds=sports_odds,   # ← NOW PASSED IN AT SCORE TIME
+                        sports_odds=sports_odds,
+                        funding_rate=_funding_data,
+                        clob_data=_clob_data,
                     )
                     score = result["score"]
                     reason = result["reason"]

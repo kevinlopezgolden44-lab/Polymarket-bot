@@ -178,6 +178,221 @@ async def get_crypto_data(question: str) -> dict:
             _crypto_cache[coingecko_id] = {"data": result, "fetched_at": now()}
         return result
 
+
+# ── BINANCE FUNDING RATES ──────────────────────────────────────────────────────
+# Free public API — no key required.
+# Funding rate > 0 = longs pay shorts = market is bullish/overleveraged long
+# Funding rate < 0 = shorts pay longs = market is bearish/overleveraged short
+# Strong negative funding = shorts overcrowded = squeeze potential = upside likely
+# Strong positive funding = longs overcrowded = dump potential = downside likely
+
+_funding_cache: dict = {}          # symbol -> {rate, fetched_at}
+FUNDING_CACHE_TTL_SECONDS = 300   # refresh every 5 minutes
+
+BINANCE_SYMBOL_MAP = {
+    "bitcoin": "BTCUSDT",
+    "btc":     "BTCUSDT",
+    "ethereum": "ETHUSDT",
+    "eth":      "ETHUSDT",
+    "solana":   "SOLUSDT",
+    "sol":      "SOLUSDT",
+    "xrp":      "XRPUSDT",
+    "ripple":   "XRPUSDT",
+}
+
+def _parse_binance_symbol(question: str) -> str:
+    """Return Binance futures symbol for the coin in question."""
+    q = question.lower()
+    for keyword, symbol in BINANCE_SYMBOL_MAP.items():
+        if keyword in q:
+            return symbol
+    return "BTCUSDT"  # default to BTC
+
+async def get_funding_rate(question: str) -> dict:
+    """
+    Fetch current perpetual futures funding rate from Binance.
+    Returns funding rate as a float and a directional signal.
+    Cached per symbol for FUNDING_CACHE_TTL_SECONDS.
+    """
+    symbol = _parse_binance_symbol(question)
+
+    cached = _funding_cache.get(symbol)
+    if cached:
+        age = (now() - cached["fetched_at"]).total_seconds()
+        if age < FUNDING_CACHE_TTL_SECONDS:
+            return cached["data"]
+
+    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rate = float(data.get("lastFundingRate", 0))
+                    rate_pct = round(rate * 100, 4)  # convert to percentage
+
+                    # Classify signal
+                    if rate_pct <= -0.05:
+                        signal = "SHORTS_OVERCROWDED"   # strong upside lean
+                        score_bonus = 8
+                    elif rate_pct <= -0.01:
+                        signal = "MILD_BEARISH_FUNDING"  # mild upside lean
+                        score_bonus = 4
+                    elif rate_pct >= 0.05:
+                        signal = "LONGS_OVERCROWDED"    # strong downside lean
+                        score_bonus = 8   # bonus applied based on market direction in scoring.py
+                    elif rate_pct >= 0.01:
+                        signal = "MILD_BULLISH_FUNDING"  # mild downside lean
+                        score_bonus = 4
+                    else:
+                        signal = "NEUTRAL"
+                        score_bonus = 0
+
+                    result = {
+                        "symbol": symbol,
+                        "rate_pct": rate_pct,
+                        "signal": signal,
+                        "score_bonus": score_bonus,
+                        "success": True,
+                    }
+                    _funding_cache[symbol] = {"data": result, "fetched_at": now()}
+                    log.debug("Funding rate %s: %.4f%% [%s]", symbol, rate_pct, signal)
+                    return result
+                else:
+                    log.warning("Binance funding rate status %d for %s", resp.status, symbol)
+    except Exception as e:
+        log.warning("Binance funding rate error: %s", e)
+    return {"success": False, "rate_pct": 0, "signal": "UNKNOWN", "score_bonus": 0}
+
+
+async def prefetch_funding_rates() -> None:
+    """
+    Prefetch funding rates for all tracked coins at scan start.
+    Keeps cache warm so per-market lookups are instant.
+    """
+    symbols = set(BINANCE_SYMBOL_MAP.values())
+    for symbol in symbols:
+        cached = _funding_cache.get(symbol)
+        if cached:
+            age = (now() - cached["fetched_at"]).total_seconds()
+            if age < FUNDING_CACHE_TTL_SECONDS:
+                continue
+        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rate = float(data.get("lastFundingRate", 0))
+                        rate_pct = round(rate * 100, 4)
+                        if rate_pct <= -0.05:
+                            signal = "SHORTS_OVERCROWDED"
+                            score_bonus = 8
+                        elif rate_pct <= -0.01:
+                            signal = "MILD_BEARISH_FUNDING"
+                            score_bonus = 4
+                        elif rate_pct >= 0.05:
+                            signal = "LONGS_OVERCROWDED"
+                            score_bonus = 8
+                        elif rate_pct >= 0.01:
+                            signal = "MILD_BULLISH_FUNDING"
+                            score_bonus = 4
+                        else:
+                            signal = "NEUTRAL"
+                            score_bonus = 0
+                        _funding_cache[symbol] = {
+                            "data": {
+                                "symbol": symbol,
+                                "rate_pct": rate_pct,
+                                "signal": signal,
+                                "score_bonus": score_bonus,
+                                "success": True,
+                            },
+                            "fetched_at": now()
+                        }
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            log.warning("Funding prefetch error for %s: %s", symbol, e)
+    log.info("Funding rates prefetched for %d symbols", len(symbols))
+
+
+# ── POLYMARKET CLOB ORDER BOOK ─────────────────────────────────────────────────
+# Free public API — no key required.
+# Returns real bid/ask sizes, giving genuine order book imbalance signal.
+# token_id is available in the gamma API market response.
+
+_clob_cache: dict = {}            # token_id -> {data, fetched_at}
+CLOB_CACHE_TTL_SECONDS = 60      # order book changes fast — refresh every minute
+
+async def get_clob_order_book(token_id: str) -> dict:
+    """
+    Fetch real order book depth from Polymarket CLOB API.
+    Returns bid/ask sizes and imbalance ratio.
+    token_id comes from market["clobTokenIds"] in gamma API response.
+    """
+    if not token_id:
+        return {"success": False}
+
+    cached = _clob_cache.get(token_id)
+    if cached:
+        age = (now() - cached["fetched_at"]).total_seconds()
+        if age < CLOB_CACHE_TTL_SECONDS:
+            return cached["data"]
+
+    url = f"https://clob.polymarket.com/book?token_id={token_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+
+                    # Sum top 5 levels of bid and ask size
+                    bid_size = sum(float(b.get("size", 0)) for b in bids[:5])
+                    ask_size = sum(float(a.get("size", 0)) for a in asks[:5])
+                    total_size = bid_size + ask_size
+
+                    if total_size == 0:
+                        return {"success": False}
+
+                    # Imbalance: positive = more bids = buy pressure
+                    imbalance = round((bid_size - ask_size) / total_size, 3)
+
+                    if imbalance > 0.3:
+                        signal = "STRONG_BUY_PRESSURE"
+                        score_bonus = 10
+                    elif imbalance > 0.1:
+                        signal = "BUY_PRESSURE"
+                        score_bonus = 5
+                    elif imbalance < -0.3:
+                        signal = "STRONG_SELL_PRESSURE"
+                        score_bonus = 10  # applied based on direction in scoring.py
+                    elif imbalance < -0.1:
+                        signal = "SELL_PRESSURE"
+                        score_bonus = 5
+                    else:
+                        signal = "BALANCED"
+                        score_bonus = 0
+
+                    result = {
+                        "bid_size": round(bid_size, 2),
+                        "ask_size": round(ask_size, 2),
+                        "imbalance": imbalance,
+                        "signal": signal,
+                        "score_bonus": score_bonus,
+                        "success": True,
+                    }
+                    _clob_cache[token_id] = {"data": result, "fetched_at": now()}
+                    log.debug("CLOB %s: imbalance=%.3f [%s]", token_id[:12], imbalance, signal)
+                    return result
+                else:
+                    log.warning("CLOB API status %d for token %s", resp.status, token_id[:12])
+    except Exception as e:
+        log.warning("CLOB order book error: %s", e)
+    return {"success": False}
+
 # ── SPORT DETECTION MAP ───────────────────────────────────────────────────────
 # Ordered — specific patterns first. NBA team nicknames listed explicitly so
 # "Grizzlies vs. 76ers" is caught even without "NBA" in the question.
