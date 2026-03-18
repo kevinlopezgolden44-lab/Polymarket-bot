@@ -276,6 +276,9 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     # Default to upside if ambiguous — safer than assuming downside
     _market_direction = "DOWNSIDE" if _is_downside and not _is_upside else "UPSIDE"
 
+    # Detect market type early — needed for funding rate gate below
+    market_type = detect_market_type(question)
+
     fear_greed_signal = None
     if category == "Crypto" and fear_greed and fear_greed.get("success"):
         bonus = fear_greed.get("sentiment_bonus", 0)
@@ -380,7 +383,8 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
     # Strong positive funding = longs overcrowded = potential dump = downside likely
     # Applied direction-aware: signal is flipped for DOWNSIDE markets.
     funding_signal = None
-    if category == "Crypto" and funding_rate and funding_rate.get("success"):
+    _funding_applicable_types = ("PRICE_TARGET", "PERCENTAGE_MOVE", "RANGE")
+    if category == "Crypto" and funding_rate and funding_rate.get("success") and market_type in _funding_applicable_types:
         fr_signal = funding_rate.get("signal", "NEUTRAL")
         fr_bonus = funding_rate.get("score_bonus", 0)
         funding_signal = fr_signal
@@ -579,7 +583,6 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
 
     confidence = calculate_confidence_tier(score, confirming, contradicting)
     reason = " | ".join(flags) if flags else "Score: " + str(score)
-    market_type = detect_market_type(question)
 
     # ── Directional recommendation ─────────────────────────────────────────────
     # Priority: Vegas gap > momentum > velocity > no edge
