@@ -1,10 +1,10 @@
 """
-Polymarket Historical Data Fetcher — v6
-Changes from v5:
-- Binary search approach: probes ahead to find the right offset
-  before starting the main fetch loop
-- Skips thousands of future-dated pages in seconds instead of minutes
-- Still no volume filter — collect everything, filter in backtest
+Polymarket Historical Data Fetcher — v7
+Changes from v6:
+- Crypto-only filter: skips non-crypto markets (cuts ~80% of records)
+- Volume floor: skips markets under $50 (untradeable noise)
+- Binary search to find date window quickly
+- This makes full-year history fetch practical
 """
 
 import asyncio
@@ -280,6 +280,25 @@ async def fetch_and_store(conn, cfg, session, headers):
                 continue
             if p["initial_price"] is None:
                 skip_reasons["no_price"] = skip_reasons.get("no_price", 0) + 1
+                continue
+
+            # Crypto filter — only store crypto markets (90%+ of live alerts)
+            _q = p["question"].lower()
+            _crypto_terms = [
+                "bitcoin", "btc", "ethereum", "eth", "crypto",
+                "solana", "xrp", "ripple", "dogecoin", "doge",
+                "pepe", "avalanche", "avax", "polygon", "matic",
+                "shiba", "shib", "chainlink", "cardano", "ada",
+                "polkadot", "bnb", "litecoin", "uniswap",
+            ]
+            if not any(t in _q for t in _crypto_terms):
+                skip_reasons["non_crypto"] = skip_reasons.get("non_crypto", 0) + 1
+                continue
+
+            # Volume floor — skip completely untradeable markets
+            _vol = p["total_volume_usd"]
+            if _vol is not None and _vol < 50:
+                skip_reasons["low_volume"] = skip_reasons.get("low_volume", 0) + 1
                 continue
 
             # Date filter
