@@ -339,15 +339,36 @@ async def fetch_and_store(conn, cfg, session, headers):
 
         page += 1
         pages_fetched += 1
+        # Reconnect every 500 pages to prevent connection timeout
+        if pages_fetched % 500 == 0:
+            try:
+                await conn.execute("SELECT 1")
+            except Exception:
+                log.info("Reconnecting at page %d...", page)
+                import asyncpg as _apg, os as _os
+                conn = await _apg.connect(_os.environ["DATABASE_URL"])
         await asyncio.sleep(RATE_DELAY)
 
-    final = await conn.fetchval(
-        "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
-    )
-    yes_rate = await conn.fetchval(
-        "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
-        "FROM historical_markets WHERE dataset=$1", dataset
-    )
+    # Use fresh connection for summary — original may have timed out
+    try:
+        final = await conn.fetchval(
+            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
+        )
+        yes_rate = await conn.fetchval(
+            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
+            "FROM historical_markets WHERE dataset=$1", dataset
+        )
+    except Exception:
+        import asyncpg as _asyncpg, os as _os
+        _conn2 = await _asyncpg.connect(_os.environ["DATABASE_URL"])
+        final = await _conn2.fetchval(
+            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
+        )
+        yes_rate = await _conn2.fetchval(
+            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
+            "FROM historical_markets WHERE dataset=$1", dataset
+        )
+        await _conn2.close()
     log.info("─" * 55)
     log.info("Done: %s", label)
     log.info("Total stored: %d", final)
@@ -376,9 +397,18 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         for cfg in DATASETS:
+            # Reconnect before each dataset in case connection timed out
+            try:
+                await conn.execute("SELECT 1")
+            except Exception:
+                log.info("Reconnecting to database...")
+                conn = await asyncpg.connect(DATABASE_URL)
             await fetch_and_store(conn, cfg, session, headers)
 
-    await conn.close()
+    try:
+        await conn.close()
+    except Exception:
+        pass
     log.info("All done — run backtest.py next")
 
 
