@@ -368,30 +368,23 @@ async def fetch_and_store(conn, cfg, session, headers):
                 conn = await _apg.connect(_os.environ["DATABASE_URL"])
         await asyncio.sleep(RATE_DELAY)
 
-    # Use fresh connection for summary — original may have timed out
+    # Summary — use fresh connection in case original timed out
     try:
-        final = await conn.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
-        )
-        yes_rate = await conn.fetchval(
-            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
-            "FROM historical_markets WHERE dataset=$1", dataset
-        )
+        await conn.execute("SELECT 1")
     except Exception:
-        import asyncpg as _asyncpg, os as _os
-        _conn2 = await _asyncpg.connect(_os.environ["DATABASE_URL"])
-        final = await _conn2.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
-        )
-        yes_rate = await _conn2.fetchval(
-            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
-            "FROM historical_markets WHERE dataset=$1", dataset
-        )
-        await _conn2.close()
+        import asyncpg as _apg
+        conn = await _apg.connect(DATABASE_URL)
+    final = await conn.fetchval(
+        "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
+    )
+    yes_count = await conn.fetchval(
+        "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1 AND resolved_yes=1", dataset
+    )
+    yes_rate = round((yes_count or 0) / final * 100, 1) if final else 0
     log.info("─" * 55)
     log.info("Done: %s", label)
     log.info("Total stored: %d", final)
-    log.info("YES rate:     %.1f%%", yes_rate or 0)
+    log.info("YES rate:     %.1f%%", yes_rate)
     log.info("Skip reasons: %s", skip_reasons)
     log.info("─" * 55)
 
@@ -406,8 +399,10 @@ async def main():
 
     existing = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
     if existing > 0:
-        log.info("Clearing %d existing records...", existing)
-        await conn.execute("TRUNCATE TABLE historical_markets RESTART IDENTITY")
+        log.info("Found %d existing records — resuming (duplicates skipped automatically)", existing)
+        log.info("To force clean re-fetch: manually run DELETE FROM historical_markets")
+    else:
+        log.info("Starting fresh fetch")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
