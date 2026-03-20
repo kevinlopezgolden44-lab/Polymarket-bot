@@ -4,6 +4,7 @@ import os
 
 async def run():
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+
     print("\n--- historical_markets summary ---")
     for dataset in ["primary", "validation"]:
         total = await conn.fetchval(
@@ -20,8 +21,33 @@ async def run():
         )
         rate = round((yes or 0) / total * 100, 1) if total else 0
         print(f"dataset={dataset} total={total} yes_rate={rate}% dates={oldest} to {newest}")
+
+    print("\n--- primary date distribution (last 30 days with data) ---")
+    rows = await conn.fetch("""
+        SELECT end_date_str, COUNT(*) as n
+        FROM historical_markets
+        WHERE dataset='primary'
+        GROUP BY end_date_str
+        ORDER BY end_date_str DESC
+        LIMIT 30
+    """)
+    for r in rows:
+        print(f"  {r['end_date_str']}: {r['n']} markets")
+
+    print("\n--- primary date distribution (oldest 30 days with data) ---")
+    rows = await conn.fetch("""
+        SELECT end_date_str, COUNT(*) as n
+        FROM historical_markets
+        WHERE dataset='primary'
+        GROUP BY end_date_str
+        ORDER BY end_date_str ASC
+        LIMIT 30
+    """)
+    for r in rows:
+        print(f"  {r['end_date_str']}: {r['n']} markets")
+
     total = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
-    print(f"\nTotal: {total}")
+    print(f"\nTotal all datasets: {total}")
     await conn.close()
 
 asyncio.run(run())
