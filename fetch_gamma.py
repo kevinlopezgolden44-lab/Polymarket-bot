@@ -26,8 +26,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
 PAGE_SIZE  = 100
-MAX_PAGES  = 800
-RATE_DELAY = 0.3
+MAX_PAGES  = 20000  # 40 pages/day × 365 days = ~14,600 pages for primary alone
+RATE_DELAY = 0.1  # reduced from 0.3 — speeds up from 73min to 25min per dataset
 
 DATASETS = [
     {
@@ -254,7 +254,8 @@ async def fetch_and_store(conn, cfg, session, headers):
     page          = start_page
     consecutive_past = 0
 
-    while page < start_page + MAX_PAGES:
+    pages_fetched = 0
+    while pages_fetched < MAX_PAGES:
         offset  = page * PAGE_SIZE
         markets = await fetch_page_raw(session, offset, headers)
 
@@ -337,6 +338,7 @@ async def fetch_and_store(conn, cfg, session, headers):
             break
 
         page += 1
+        pages_fetched += 1
         await asyncio.sleep(RATE_DELAY)
 
     final = await conn.fetchval(
