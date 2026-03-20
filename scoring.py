@@ -28,45 +28,81 @@ def detect_category(question):
     """
     Derives a category string from the market question.
     Returns one of: Crypto, Sports, Politics, Economics, Science, General.
+
+    Uses word boundary matching for short ambiguous tickers (eth, sol, bnb)
+    to prevent false positives like "Sola" → Crypto or "console" → Crypto.
     """
     q = question.lower()
-    if any(w in q for w in ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "xrp", "ripple"]):
+
+    # ── Crypto detection ──────────────────────────────────────────────────────
+    # Long-form names: safe as substring match (unlikely to appear in other context)
+    crypto_explicit = [
+        "bitcoin", "btc", "ethereum", "crypto",
+        "solana", "xrp", "ripple",
+        # Additional coins common on Polymarket
+        "dogecoin", "doge", "pepe", "avalanche", "avax",
+        "polygon", "matic", "shiba", "shib", "chainlink",
+        "binance coin", "bnb coin", "uniswap", "litecoin",
+        "cardano", "ada", "polkadot", "dot",
+    ]
+    if any(w in q for w in crypto_explicit):
         return "Crypto"
 
+    # Short tickers need word boundaries to avoid false positives:
+    # "eth" matches "whether", "method", "Seth", "abeth"
+    # "sol" matches "Sola", "solar", "console", "solution"
+    # "bnb" matches "bnb" only (rare in non-crypto context, but still safer)
+    if re.search(r'\b(eth|sol|bnb|link)\b', q):
+        return "Crypto"
+
+    # ── Sports detection ──────────────────────────────────────────────────────
     # "Team A vs. Team B" — strongest signal for any head-to-head matchup
-    # catches college games, international fixtures, any sport not in keyword list
     if " vs " in q or " vs. " in q:
         return "Sports"
 
+    # Short league codes need word boundaries to avoid false matches:
+    # "nfl" appears in "inflation", "nba" in "canba", "mlb" in "mlb-style" etc.
+    if re.search(r'\b(nba|nfl|mlb|nhl|ufc|mls|pga|ncaa)\b', q):
+        return "Sports"
+
     sports_keywords = [
-        # Leagues / tournaments
-        "nba", "nfl", "mlb", "nhl", "ufc", "soccer", "world cup", "champions league",
+        # Leagues / tournaments (longer phrases safe as substring)
+        "soccer", "world cup", "champions league",
         "super bowl", "march madness", "ncaa", "premier league", "mls", "pga", "masters",
         "stanley cup", "world series", "nba finals", "playoffs", "championship",
         # Generic sports phrases
         "win the game", "win tonight", "win the match", "win the series",
         "cover the spread", "over/under", "beat the", "defeat the",
         # NBA teams
-        "lakers", "celtics", "warriors", "bucks", "nets", "heat", "suns", "nuggets",
-        "clippers", "76ers", "sixers", "knicks", "bulls", "spurs", "mavs", "mavericks",
+        "lakers", "celtics", "warriors", "bucks", "nets", "suns", "nuggets",
+        "clippers", "76ers", "sixers", "knicks", "spurs", "mavs", "mavericks",
+        "grizzlies", "rockets", "thunder", "blazers", "timberwolves",
+        "pistons", "hornets", "wizards", "magic", "hawks", "jazz", "kings",
+        "pelicans", "cavaliers", "cavs", "raptors", "pacers",
         # NFL teams
         "chiefs", "eagles", "cowboys", "patriots", "49ers", "packers", "ravens",
         "bills", "broncos", "steelers", "raiders", "seahawks", "rams", "chargers",
+        "dolphins", "vikings", "falcons", "saints", "buccaneers",
         # MLB teams
         "yankees", "dodgers", "red sox", "cubs", "astros", "braves", "mets",
         # NHL teams
         "maple leafs", "canadiens", "bruins", "rangers", "blackhawks",
         # UFC / MMA
-        "knockout", "submission", "mma fight", "boxing match",
+        "knockout", "submission", "mma fight", "boxing match", "fight night",
+        "ufc fight", "prelims", "main card", "lightweight", "heavyweight",
+        "middleweight", "welterweight", "featherweight",
         # Soccer clubs
         "manchester", "barcelona", "real madrid", "liverpool", "arsenal", "chelsea",
-        # College sports indicators
-        "wildcats", "panthers", "bulldogs", "tigers", "bears", "wolves", "eagles",
-        "a&m", "university", "college game",
+        # College sports
+        "a&m", "college game",
+        # NOTE: removed ambiguous terms "heat", "bulls", "bears", "eagles", "panthers",
+        # "wolves", "wildcats", "bulldogs", "tigers" — too common in non-sports context.
+        # These are caught by the "vs" check or team-specific phrases instead.
     ]
     if any(w in q for w in sports_keywords):
         return "Sports"
 
+    # ── Other categories ───────────────────────────────────────────────────────
     if any(w in q for w in ["election", "president", "senate", "congress", "vote", "poll", "party",
                              "democrat", "republican", "governor", "primary", "midterm"]):
         return "Politics"
