@@ -1,15 +1,11 @@
 """
-Polymarket Historical Data Fetcher — Fixed Version
-Pulls resolved market data from Polymarket's Gamma API
-and stores it in your PostgreSQL database.
-
-Start command: python fetch_gamma.py
-
-Changes from v1:
-- Added debug output for first page to diagnose field issues
-- Removed date params (Gamma API ignores them) — filters client-side instead
-- Fixed outcomePrices parsing to correctly detect YES/NO resolution
-- Loosened filters to accept more markets
+Polymarket Historical Data Fetcher — v5
+Changes from v4:
+- No volume filter at all during fetch — collect everything
+- Smart stop: skips pages where ALL markets are outside date range
+  (handles future-dated markets that appear first in API results)
+- Continues scrolling until it finds markets in the target window
+- Volume filtering happens entirely in backtest.py
 """
 
 import asyncio
@@ -31,22 +27,21 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
 PAGE_SIZE  = 100
-MAX_PAGES  = 300
-MIN_VOLUME = 500   # lowered from 1000 to capture more markets
-RATE_DELAY = 0.4
+MAX_PAGES  = 600
+RATE_DELAY = 0.3
 
 DATASETS = [
     {
-        "label":   "Primary (Apr 2025 - Mar 2026)",
-        "dataset": "primary",
-        "start":   "2025-04-01",
-        "end":     "2026-03-20",
+        "label":        "Primary (ended Apr 2025 - Mar 2026)",
+        "dataset":      "primary",
+        "end_date_min": "2025-04-01",
+        "end_date_max": "2026-03-20",
     },
     {
-        "label":   "Validation (Jan 2024 - Mar 2025)",
-        "dataset": "validation",
-        "start":   "2024-01-01",
-        "end":     "2025-04-01",
+        "label":        "Validation (ended Jan 2024 - Mar 2025)",
+        "dataset":      "validation",
+        "end_date_min": "2024-01-01",
+        "end_date_max": "2025-04-01",
     },
 ]
 
@@ -61,6 +56,7 @@ async def init_table(conn):
             dataset                  TEXT NOT NULL,
             created_at               TIMESTAMP,
             end_date                 TIMESTAMP,
+            end_date_str             TEXT,
             initial_bid              FLOAT,
             initial_ask              FLOAT,
             initial_price            FLOAT,
@@ -83,7 +79,6 @@ def parse_price(val):
 
 
 def parse_outcome_prices(val):
-    """Parse outcomePrices — returns (yes_price, no_price) tuple."""
     try:
         prices = json.loads(val) if isinstance(val, str) else val
         if not prices or not isinstance(prices, list):
@@ -105,60 +100,32 @@ def parse_dt(val):
         return None
 
 
-def debug_market(m):
-    """Print key fields from a market for debugging."""
-    log.info("  DEBUG market fields:")
-    for key in ["id", "question", "resolved", "closed", "outcomePrices",
-                "bestBid", "bestAsk", "volumeNum", "volume", "volume24hr",
-                "startDate", "createdAt", "endDate", "category"]:
-        val = m.get(key)
-        if isinstance(val, str) and len(val) > 80:
-            val = val[:80] + "..."
-        log.info("    %s: %s", key, repr(val))
-
-
 def parse_market(m, dataset):
-    """
-    Parse a market from the Gamma API response.
-
-    Key insight: outcomePrices at resolution time:
-    - If resolved YES: prices = ["1", "0"] or ["0.99", "0.01"]
-    - If resolved NO:  prices = ["0", "1"] or ["0.01", "0.99"]
-    - If still open:   prices = mid-market prices like ["0.45", "0.55"]
-    """
     yes_p, no_p = parse_outcome_prices(m.get("outcomePrices"))
 
     bid = parse_price(m.get("bestBid"))
     ask = parse_price(m.get("bestAsk"))
 
-    # For resolved markets, outcomePrices shows final resolution
-    # For the initial price we want the mid at time of creation
-    # Since we don't have historical snapshots, use current bid/ask mid
-    # or fall back to yes_p if bid/ask not available
-    if bid is not None and ask is not None and bid > 0 and ask > 0:
-        initial_price = (bid + ask) / 2
+    if bid is not None and ask is not None and 0 < bid < ask:
+        initial_price = round((bid + ask) / 2, 4)
     elif yes_p is not None:
         initial_price = yes_p
     else:
         initial_price = None
 
-    # Determine resolution outcome
     resolved_yes = None
-    is_resolved = m.get("resolved", False)
-    is_closed   = m.get("closed", False)
+    if (m.get("resolved") or m.get("closed")) and yes_p is not None:
+        if yes_p >= 0.90:
+            resolved_yes = 1
+        elif yes_p <= 0.10:
+            resolved_yes = 0
 
-    if (is_resolved or is_closed) and yes_p is not None:
-        if yes_p >= 0.95:
-            resolved_yes = 1   # resolved YES
-        elif yes_p <= 0.05:
-            resolved_yes = 0   # resolved NO
-        # else: ambiguous resolution, skip
-
-    created_at = parse_dt(m.get("startDate") or m.get("createdAt"))
-    end_date   = parse_dt(m.get("endDate"))
+    created_at   = parse_dt(m.get("startDate") or m.get("createdAt"))
+    end_date     = parse_dt(m.get("endDate"))
+    end_date_str = end_date.strftime("%Y-%m-%d") if end_date else None
 
     duration = None
-    if created_at and end_date:
+    if created_at and end_date and end_date > created_at:
         duration = round((end_date - created_at).total_seconds() / 3600, 1)
 
     return {
@@ -168,6 +135,7 @@ def parse_market(m, dataset):
         "dataset":                 dataset,
         "created_at":              created_at,
         "end_date":                end_date,
+        "end_date_str":            end_date_str,
         "initial_bid":             bid,
         "initial_ask":             ask,
         "initial_price":           initial_price,
@@ -177,32 +145,18 @@ def parse_market(m, dataset):
         "volume_24h_usd":          parse_price(m.get("volume24hr")),
         "time_to_resolution_hours": duration,
         "fetched_at":              datetime.utcnow(),
-        "_created_str":            created_at.strftime("%Y-%m-%d") if created_at else None,
     }
 
 
-def is_valid(p, start, end):
-    """Quality and date filters."""
-    if not p["market_id"] or not p["question"]:
-        return False, "no_id_or_question"
-    if p["resolved_yes"] is None:
-        return False, "no_outcome"
-    if p["initial_price"] is None:
-        return False, "no_price"
-    if not p["total_volume_usd"] or p["total_volume_usd"] < MIN_VOLUME:
-        return False, f"low_volume_{p['total_volume_usd']}"
-    # Date filter on creation date
-    d = p["_created_str"]
-    if d and not (start <= d <= end):
-        return False, f"wrong_date_{d}"
-    return True, None
-
-
 async def fetch_and_store(conn, cfg):
-    label, dataset, start, end = cfg["label"], cfg["dataset"], cfg["start"], cfg["end"]
+    label   = cfg["label"]
+    dataset = cfg["dataset"]
+    end_min = cfg["end_date_min"]
+    end_max = cfg["end_date_max"]
+
     log.info("=" * 55)
     log.info("Fetching: %s", label)
-    log.info("Date range: %s → %s", start, end)
+    log.info("End date range: %s → %s", end_min, end_max)
     log.info("=" * 55)
 
     existing = await conn.fetchval(
@@ -210,18 +164,17 @@ async def fetch_and_store(conn, cfg):
     )
     log.info("Already in DB: %d", existing)
 
-    total_stored  = 0
-    total_skipped = 0
-    skip_reasons  = {}
-    page = 0
-    debug_done = False
+    total_stored       = 0
+    total_skipped      = 0
+    skip_reasons       = {}
+    page               = 0
+    consecutive_future = 0   # pages where all markets are in the future
+    consecutive_past   = 0   # pages where all markets are before our window
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-
-    # NOTE: Gamma API date params are unreliable — we filter client-side instead
     base_params = {
         "closed":    "true",
         "resolved":  "true",
@@ -255,42 +208,57 @@ async def fetch_and_store(conn, cfg):
                 log.info("Empty page — done")
                 break
 
-            # Debug first page to show actual field values
-            if not debug_done and markets:
-                log.info("--- DEBUG: First market in response ---")
-                debug_market(markets[0])
-                log.info("--- Sample parsed ---")
-                sample = parse_market(markets[0], dataset)
-                for k, v in sample.items():
-                    log.info("  %s: %s", k, repr(v))
-                log.info("--- End debug ---")
-                debug_done = True
+            page_stored  = 0
+            page_dates   = []
 
-            page_stored = 0
             for m in markets:
                 p = parse_market(m, dataset)
-                valid, reason = is_valid(p, start, end)
-                if not valid:
+
+                if p["end_date_str"]:
+                    page_dates.append(p["end_date_str"])
+
+                # Minimal validity checks — no volume filter
+                if not p["market_id"] or not p["question"]:
+                    skip_reasons["no_id"] = skip_reasons.get("no_id", 0) + 1
                     total_skipped += 1
-                    # Track top skip reasons
-                    r_key = reason.split("_")[0] if "_" in reason else reason
-                    skip_reasons[r_key] = skip_reasons.get(r_key, 0) + 1
                     continue
+                if p["resolved_yes"] is None:
+                    skip_reasons["no_outcome"] = skip_reasons.get("no_outcome", 0) + 1
+                    total_skipped += 1
+                    continue
+                if p["initial_price"] is None:
+                    skip_reasons["no_price"] = skip_reasons.get("no_price", 0) + 1
+                    total_skipped += 1
+                    continue
+
+                # Date filter
+                d = p["end_date_str"]
+                if d:
+                    if d > end_max:
+                        skip_reasons["future"] = skip_reasons.get("future", 0) + 1
+                        total_skipped += 1
+                        continue
+                    if d < end_min:
+                        skip_reasons["too_old"] = skip_reasons.get("too_old", 0) + 1
+                        total_skipped += 1
+                        continue
 
                 try:
                     await conn.execute("""
                         INSERT INTO historical_markets (
                             market_id, question, raw_category, dataset,
-                            created_at, end_date, initial_bid, initial_ask,
-                            initial_price, resolution_price, resolved_yes,
+                            created_at, end_date, end_date_str,
+                            initial_bid, initial_ask, initial_price,
+                            resolution_price, resolved_yes,
                             total_volume_usd, volume_24h_usd,
                             time_to_resolution_hours, fetched_at
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                         ON CONFLICT (market_id) DO NOTHING
                     """,
                         p["market_id"], p["question"], p["raw_category"], p["dataset"],
-                        p["created_at"], p["end_date"], p["initial_bid"], p["initial_ask"],
-                        p["initial_price"], p["resolution_price"], p["resolved_yes"],
+                        p["created_at"], p["end_date"], p["end_date_str"],
+                        p["initial_bid"], p["initial_ask"], p["initial_price"],
+                        p["resolution_price"], p["resolved_yes"],
                         p["total_volume_usd"], p["volume_24h_usd"],
                         p["time_to_resolution_hours"], p["fetched_at"]
                     )
@@ -299,16 +267,36 @@ async def fetch_and_store(conn, cfg):
                 except Exception as e:
                     log.warning("Insert error: %s", e)
 
+            # Determine page date range
+            min_date = min(page_dates) if page_dates else None
+            max_date = max(page_dates) if page_dates else None
+
             log.info(
-                "Page %d | fetched=%d stored=%d skipped=%d | total_stored=%d",
-                page + 1, len(markets), page_stored,
-                total_skipped - (total_skipped - (len(markets) - page_stored)),
-                total_stored
+                "Page %d | stored=%d | total=%d | dates=%s→%s | skips=%s",
+                page + 1, page_stored, total_stored,
+                min_date, max_date, skip_reasons
             )
 
-            # Log skip reasons every 5 pages
-            if page > 0 and page % 5 == 0:
-                log.info("Skip reasons so far: %s", skip_reasons)
+            # Smart stopping logic
+            if page_dates:
+                all_future = all(d > end_max for d in page_dates)
+                all_past   = all(d < end_min for d in page_dates)
+
+                if all_future:
+                    consecutive_future += 1
+                    if consecutive_future >= 3:
+                        log.info("3 consecutive future pages — skipping ahead faster")
+                        # Don't stop — keep scrolling, just log
+                else:
+                    consecutive_future = 0
+
+                if all_past:
+                    consecutive_past += 1
+                    if consecutive_past >= 3:
+                        log.info("3 consecutive past pages — passed our date window, stopping")
+                        break
+                else:
+                    consecutive_past = 0
 
             if len(markets) < PAGE_SIZE:
                 log.info("Last page")
@@ -317,22 +305,38 @@ async def fetch_and_store(conn, cfg):
             page += 1
             await asyncio.sleep(RATE_DELAY)
 
-    log.info("Skip reasons: %s", skip_reasons)
-
     final = await conn.fetchval(
         "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
     )
-    log.info("Total stored for %s: %d", dataset, final)
+    yes_rate = await conn.fetchval(
+        "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
+        "FROM historical_markets WHERE dataset=$1", dataset
+    )
+    log.info("─" * 55)
+    log.info("Done: %s", label)
+    log.info("Total stored: %d", final)
+    log.info("YES rate:     %.1f%%", yes_rate or 0)
+    log.info("Skip reasons: %s", skip_reasons)
+    log.info("─" * 55)
 
 
 async def main():
     if not DATABASE_URL:
         log.error("DATABASE_URL not set")
         return
+
     conn = await asyncpg.connect(DATABASE_URL)
     await init_table(conn)
+
+    # Clear and re-fetch
+    existing = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
+    if existing > 0:
+        log.info("Clearing %d existing records...", existing)
+        await conn.execute("TRUNCATE TABLE historical_markets RESTART IDENTITY")
+
     for cfg in DATASETS:
         await fetch_and_store(conn, cfg)
+
     await conn.close()
     log.info("All done — run backtest.py next")
 
