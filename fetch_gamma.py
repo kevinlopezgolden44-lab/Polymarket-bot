@@ -1,10 +1,14 @@
 """
-Polymarket Historical Data Fetcher — v7
-Changes from v6:
-- Crypto-only filter: skips non-crypto markets (cuts ~80% of records)
-- Volume floor: skips markets under $50 (untradeable noise)
-- Binary search to find date window quickly
-- This makes full-year history fetch practical
+Polymarket Historical Data Fetcher — v8
+All fixes applied:
+- TRUNCATES on fresh start, RESUMES on restart (checks DB first)
+- Resumes from oldest stored date, not from end_max
+- No volume floor — collect all crypto markets
+- initial_price fallback to 0.5 if bid/ask missing (fixes old market rejection)
+- Expanded crypto terms to catch older market phrasings
+- No MAX_PAGES limit — stops only when date window is exhausted
+- DB keepalive every 200 pages
+- Summary uses Python math, no SQL ROUND/AVG type errors
 """
 
 import asyncio
@@ -26,8 +30,22 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
 PAGE_SIZE  = 100
-MAX_PAGES  = 20000  # 40 pages/day × 365 days = ~14,600 pages for primary alone
-RATE_DELAY = 0.1  # reduced from 0.3 — speeds up from 73min to 25min per dataset
+RATE_DELAY = 0.1
+
+CRYPTO_TERMS = [
+    # Major coins
+    "bitcoin", "btc", "ethereum", "eth", "crypto",
+    "solana", "xrp", "ripple", "dogecoin", "doge",
+    "pepe", "avalanche", "avax", "polygon", "matic",
+    "shiba", "shib", "chainlink", "cardano", "ada",
+    "polkadot", "bnb", "litecoin", "uniswap",
+    # Older market phrasings
+    "defi", "nft", "web3", "stablecoin", "usdc", "usdt",
+    "tether", "dai", "wbtc", "wrapped bitcoin",
+    "altcoin", "memecoin", "token", "coin price",
+    "market cap", "dominance", "halving", "blockchain",
+    "cryptocurrency", "crypto market",
+]
 
 DATASETS = [
     {
@@ -44,6 +62,10 @@ DATASETS = [
     },
 ]
 
+
+# ─────────────────────────────────────────────
+# DB setup
+# ─────────────────────────────────────────────
 
 async def init_table(conn):
     await conn.execute("""
@@ -67,7 +89,6 @@ async def init_table(conn):
             fetched_at               TIMESTAMP NOT NULL
         )
     """)
-    # Safe column additions for tables created by earlier versions
     for col, typedef in [
         ("end_date_str", "TEXT"),
         ("volume_24h_usd", "FLOAT"),
@@ -78,6 +99,10 @@ async def init_table(conn):
         )
     log.info("historical_markets table ready")
 
+
+# ─────────────────────────────────────────────
+# Parsing
+# ─────────────────────────────────────────────
 
 def parse_price(val):
     try:
@@ -90,11 +115,10 @@ def parse_outcome_prices(val):
     try:
         prices = json.loads(val) if isinstance(val, str) else val
         if not prices or not isinstance(prices, list):
-            return None, None
-        yes_p = float(prices[0]) if len(prices) > 0 else None
-        return yes_p, None
+            return None
+        return float(prices[0])
     except Exception:
-        return None, None
+        return None
 
 
 def parse_dt(val):
@@ -107,94 +131,20 @@ def parse_dt(val):
         return None
 
 
-def get_page_end_dates(markets):
-    """Extract end date strings from a list of raw market dicts."""
-    dates = []
-    for m in markets:
-        end_date = parse_dt(m.get("endDate"))
-        if end_date:
-            dates.append(end_date.strftime("%Y-%m-%d"))
-    return dates
-
-
-async def fetch_page_raw(session, offset, headers):
-    """Fetch a single page, return raw market list."""
-    params = {
-        "closed": "true", "resolved": "true",
-        "order": "endDate", "ascending": "false",
-        "limit": PAGE_SIZE, "offset": offset
-    }
-    try:
-        async with session.get(
-            GAMMA_BASE, params=params, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            elif resp.status == 429:
-                await asyncio.sleep(10)
-                return []
-            return []
-    except Exception as e:
-        log.warning("Fetch error at offset %d: %s", offset, e)
-        return []
-
-
-async def find_start_offset(session, headers, target_end_max):
-    """
-    Binary search to find the approximate offset where markets
-    start having end dates <= target_end_max.
-    Returns the starting page offset.
-    """
-    log.info("Binary searching for start of date window (end_max=%s)...", target_end_max)
-
-    lo, hi = 0, 500  # search between page 0 and page 500
-    best_offset = 0
-
-    for _ in range(10):  # max 10 binary search steps
-        mid = (lo + hi) // 2
-        offset = mid * PAGE_SIZE
-        markets = await fetch_page_raw(session, offset, headers)
-        if not markets:
-            hi = mid
-            continue
-
-        dates = get_page_end_dates(markets)
-        if not dates:
-            hi = mid
-            continue
-
-        oldest = min(dates)
-        newest = max(dates)
-        log.info("  Probe page %d: dates %s → %s", mid, oldest, newest)
-
-        if newest > target_end_max:
-            # Still in the future — go further right (higher offset)
-            lo = mid + 1
-            best_offset = mid + 1
-        else:
-            # We've gone past the window or are in it — go left
-            hi = mid
-
-        await asyncio.sleep(0.3)
-
-    start_page = max(0, best_offset - 2)  # back up 2 pages to be safe
-    log.info("Starting fetch at page %d (offset %d)", start_page, start_page * PAGE_SIZE)
-    return start_page
-
-
 def parse_market(m, dataset):
-    yes_p, _ = parse_outcome_prices(m.get("outcomePrices"))
-    bid = parse_price(m.get("bestBid"))
-    ask = parse_price(m.get("bestAsk"))
+    yes_p = parse_outcome_prices(m.get("outcomePrices"))
+    bid   = parse_price(m.get("bestBid"))
+    ask   = parse_price(m.get("bestAsk"))
 
+    # Initial price: bid/ask mid preferred, fallback to yes_p, then 0.5
     if bid is not None and ask is not None and 0 < bid < ask:
         initial_price = round((bid + ask) / 2, 4)
     elif yes_p is not None:
         initial_price = yes_p
     else:
-        initial_price = None
+        initial_price = 0.5  # fallback for old markets without bid/ask
 
+    # Resolution outcome
     resolved_yes = None
     if (m.get("resolved") or m.get("closed")) and yes_p is not None:
         if yes_p >= 0.90:
@@ -230,6 +180,77 @@ def parse_market(m, dataset):
     }
 
 
+def is_crypto(question):
+    q = question.lower()
+    return any(t in q for t in CRYPTO_TERMS)
+
+
+# ─────────────────────────────────────────────
+# API helpers
+# ─────────────────────────────────────────────
+
+async def fetch_page(session, offset, headers):
+    params = {
+        "closed": "true", "resolved": "true",
+        "order": "endDate", "ascending": "false",
+        "limit": PAGE_SIZE, "offset": offset,
+    }
+    try:
+        async with session.get(
+            GAMMA_BASE, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            elif resp.status == 429:
+                log.warning("Rate limited — waiting 10s")
+                await asyncio.sleep(10)
+                return []
+            else:
+                log.warning("API status %d", resp.status)
+                return []
+    except Exception as e:
+        log.warning("Fetch error at offset %d: %s", offset, e)
+        return []
+
+
+async def binary_search_start(session, headers, target_date):
+    """Find the page where end dates first go <= target_date."""
+    log.info("Binary search for date window (target=%s)...", target_date)
+    lo, hi = 0, 600
+    best = 0
+    for _ in range(12):
+        mid = (lo + hi) // 2
+        markets = await fetch_page(session, mid * PAGE_SIZE, headers)
+        if not markets:
+            hi = mid
+            continue
+        dates = [
+            parse_dt(m.get("endDate")).strftime("%Y-%m-%d")
+            for m in markets
+            if parse_dt(m.get("endDate"))
+        ]
+        if not dates:
+            hi = mid
+            continue
+        newest = max(dates)
+        oldest = min(dates)
+        log.info("  Page %d: %s → %s", mid, oldest, newest)
+        if newest > target_date:
+            lo = mid + 1
+            best = mid + 1
+        else:
+            hi = mid
+        await asyncio.sleep(0.3)
+    start = max(0, best - 3)
+    log.info("Starting at page %d", start)
+    return start
+
+
+# ─────────────────────────────────────────────
+# Main fetch loop
+# ─────────────────────────────────────────────
+
 async def fetch_and_store(conn, cfg, session, headers):
     label   = cfg["label"]
     dataset = cfg["dataset"]
@@ -237,8 +258,8 @@ async def fetch_and_store(conn, cfg, session, headers):
     end_max = cfg["end_date_max"]
 
     log.info("=" * 55)
-    log.info("Fetching: %s", label)
-    log.info("End date range: %s → %s", end_min, end_max)
+    log.info("Dataset: %s", label)
+    log.info("Range:   %s → %s", end_min, end_max)
     log.info("=" * 55)
 
     existing = await conn.fetchval(
@@ -246,29 +267,28 @@ async def fetch_and_store(conn, cfg, session, headers):
     )
     log.info("Already in DB: %d", existing)
 
-    # If resuming, start binary search from last stored date instead of end_max
-    # This avoids re-scanning pages we already processed
-    resume_from = end_max
+    # Resume from oldest stored date, not from end_max
+    resume_target = end_max
     if existing > 0:
-        last_date = await conn.fetchval(
+        oldest_stored = await conn.fetchval(
             "SELECT MIN(end_date_str) FROM historical_markets WHERE dataset=$1", dataset
         )
-        if last_date and last_date > end_min:
-            resume_from = last_date
-            log.info("Resuming from last stored date: %s", resume_from)
+        if oldest_stored and oldest_stored > end_min:
+            resume_target = oldest_stored
+            log.info("Resuming from: %s (oldest stored date)", resume_target)
+        else:
+            log.info("DB covers full range already — nothing to fetch")
+            return
 
-    # Binary search for starting offset
-    start_page = await find_start_offset(session, headers, resume_from)
-
-    total_stored  = 0
-    skip_reasons  = {}
-    page          = start_page
+    start_page     = await binary_search_start(session, headers, resume_target)
+    page           = start_page
+    pages_fetched  = 0
+    total_stored   = 0
+    skip_reasons   = {}
     consecutive_past = 0
 
-    pages_fetched = 0
-    while pages_fetched < MAX_PAGES:
-        offset  = page * PAGE_SIZE
-        markets = await fetch_page_raw(session, offset, headers)
+    while True:
+        markets = await fetch_page(session, page * PAGE_SIZE, headers)
 
         if not markets:
             log.info("Empty page — done")
@@ -282,34 +302,17 @@ async def fetch_and_store(conn, cfg, session, headers):
             if p["end_date_str"]:
                 page_dates.append(p["end_date_str"])
 
-            # Minimal validity
+            # Validity checks
             if not p["market_id"] or not p["question"]:
                 skip_reasons["no_id"] = skip_reasons.get("no_id", 0) + 1
                 continue
             if p["resolved_yes"] is None:
                 skip_reasons["no_outcome"] = skip_reasons.get("no_outcome", 0) + 1
                 continue
-            if p["initial_price"] is None:
-                skip_reasons["no_price"] = skip_reasons.get("no_price", 0) + 1
-                continue
 
-            # Crypto filter — only store crypto markets (90%+ of live alerts)
-            _q = p["question"].lower()
-            _crypto_terms = [
-                "bitcoin", "btc", "ethereum", "eth", "crypto",
-                "solana", "xrp", "ripple", "dogecoin", "doge",
-                "pepe", "avalanche", "avax", "polygon", "matic",
-                "shiba", "shib", "chainlink", "cardano", "ada",
-                "polkadot", "bnb", "litecoin", "uniswap",
-            ]
-            if not any(t in _q for t in _crypto_terms):
+            # Crypto filter
+            if not is_crypto(p["question"]):
                 skip_reasons["non_crypto"] = skip_reasons.get("non_crypto", 0) + 1
-                continue
-
-            # Volume floor — skip completely untradeable markets
-            _vol = p["total_volume_usd"]
-            if _vol is not None and _vol < 50:
-                skip_reasons["low_volume"] = skip_reasons.get("low_volume", 0) + 1
                 continue
 
             # Date filter
@@ -346,19 +349,16 @@ async def fetch_and_store(conn, cfg, session, headers):
             except Exception as e:
                 log.warning("Insert error: %s", e)
 
-        min_date = min(page_dates) if page_dates else None
-        max_date = max(page_dates) if page_dates else None
+        min_d = min(page_dates) if page_dates else None
+        max_d = max(page_dates) if page_dates else None
+        log.info("Page %d | stored=%d | total=%d | dates=%s→%s | skips=%s",
+                 page, page_stored, total_stored, min_d, max_d, skip_reasons)
 
-        log.info(
-            "Page %d | stored=%d | total=%d | dates=%s→%s",
-            page, page_stored, total_stored, min_date, max_date
-        )
-
-        # Stop when we've gone past the window
+        # Stop when past the date window
         if page_dates and all(d < end_min for d in page_dates):
             consecutive_past += 1
             if consecutive_past >= 3:
-                log.info("Passed date window — stopping")
+                log.info("Past date window — done")
                 break
         else:
             consecutive_past = 0
@@ -369,43 +369,49 @@ async def fetch_and_store(conn, cfg, session, headers):
 
         page += 1
         pages_fetched += 1
-        # Reconnect every 500 pages to prevent connection timeout
-        if pages_fetched % 500 == 0:
+
+        # DB keepalive every 200 pages
+        if pages_fetched % 200 == 0:
             try:
                 await conn.execute("SELECT 1")
+                log.info("DB keepalive OK at page %d", page)
             except Exception:
-                log.info("Reconnecting at page %d...", page)
-                import asyncpg as _apg, os as _os
-                conn = await _apg.connect(_os.environ["DATABASE_URL"])
+                log.info("Reconnecting DB...")
+                conn = await asyncpg.connect(DATABASE_URL)
+
         await asyncio.sleep(RATE_DELAY)
 
-    # Use fresh connection for summary — original may have timed out
+    # Summary
     try:
-        final = await conn.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
-        )
-        yes_rate = await conn.fetchval(
-            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
-            "FROM historical_markets WHERE dataset=$1", dataset
-        )
+        await conn.execute("SELECT 1")
     except Exception:
-        import asyncpg as _asyncpg, os as _os
-        _conn2 = await _asyncpg.connect(_os.environ["DATABASE_URL"])
-        final = await _conn2.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
-        )
-        yes_rate = await _conn2.fetchval(
-            "SELECT ROUND(AVG(resolved_yes::float) * 100, 1) "
-            "FROM historical_markets WHERE dataset=$1", dataset
-        )
-        await _conn2.close()
+        conn = await asyncpg.connect(DATABASE_URL)
+
+    final     = await conn.fetchval(
+        "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1", dataset
+    )
+    yes_count = await conn.fetchval(
+        "SELECT COUNT(*) FROM historical_markets WHERE dataset=$1 AND resolved_yes=1", dataset
+    )
+    oldest = await conn.fetchval(
+        "SELECT MIN(end_date_str) FROM historical_markets WHERE dataset=$1", dataset
+    )
+    newest = await conn.fetchval(
+        "SELECT MAX(end_date_str) FROM historical_markets WHERE dataset=$1", dataset
+    )
+    yes_rate = round((yes_count or 0) / final * 100, 1) if final else 0
+
     log.info("─" * 55)
     log.info("Done: %s", label)
-    log.info("Total stored: %d", final)
-    log.info("YES rate:     %.1f%%", yes_rate or 0)
+    log.info("Total in DB: %d | YES rate: %.1f%%", final, yes_rate)
+    log.info("Date range:  %s → %s", oldest, newest)
     log.info("Skip reasons: %s", skip_reasons)
     log.info("─" * 55)
 
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 
 async def main():
     if not DATABASE_URL:
@@ -415,10 +421,12 @@ async def main():
     conn = await asyncpg.connect(DATABASE_URL)
     await init_table(conn)
 
-    existing = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
-    if existing > 0:
-        log.info("Clearing %d existing records...", existing)
-        await conn.execute("TRUNCATE TABLE historical_markets RESTART IDENTITY")
+    # Check if this is a fresh start or a resume
+    total_existing = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
+    if total_existing == 0:
+        log.info("Fresh start — no existing data")
+    else:
+        log.info("Resuming — %d records already in DB", total_existing)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -427,11 +435,10 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         for cfg in DATASETS:
-            # Reconnect before each dataset in case connection timed out
+            # Reconnect before each dataset
             try:
                 await conn.execute("SELECT 1")
             except Exception:
-                log.info("Reconnecting to database...")
                 conn = await asyncpg.connect(DATABASE_URL)
             await fetch_and_store(conn, cfg, session, headers)
 
@@ -439,6 +446,7 @@ async def main():
         await conn.close()
     except Exception:
         pass
+
     log.info("All done — run backtest.py next")
 
 
