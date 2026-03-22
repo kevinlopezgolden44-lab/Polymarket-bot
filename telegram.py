@@ -68,7 +68,7 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
 
     entry = opp["yes_price"]
     take_profit_price = round(min(entry * 1.40, 0.99), 2)
-    stop_loss_price   = round(max(entry * 0.75, 0.01), 2)
+    stop_loss_price   = round(max(entry * 0.80, 0.01), 2)  # -20% stop loss (was 0.75 = -25%)
 
     msg = (
         confidence_emoji + " <b>Opportunity Found!</b> " + category_emoji + "\n\n"
@@ -81,7 +81,7 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
         "<b>Volume:</b> $" + str(round(opp["volume"])) + "\n\n"
         "<b>Position Management:</b>\n"
         "  Take Profit: " + str(round(take_profit_price * 100)) + "¢ (+40%)\n"
-        "  Stop Loss:   " + str(round(stop_loss_price * 100)) + "¢ (-25%)\n"
+        "  Stop Loss:   " + str(round(stop_loss_price * 100)) + "¢ (-20%)\n"
         "  Max Trade:   $" + str(limits["max_trade_size"]) + "\n"
     )
 

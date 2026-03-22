@@ -561,6 +561,9 @@ THERUNDOWN_SPORT_IDS = {
 _sports_odds_cache: dict = {}       # sport_key -> {games, fetched_at}
 _sports_quota_exhausted: bool = False  # True after first 429 — reset at midnight
 _sports_quota_reset_date: str = ""     # date string when quota was exhausted
+_sports_daily_calls: int = 0           # count of API calls today
+_sports_daily_calls_date: str = ""     # date these calls were counted
+SPORTS_DAILY_CALL_LIMIT = 50           # hard cap — 20k/day limit, ~5 sports × 3 scans/day = 15 calls normally
 
 
 async def load_sports_quota_state(conn) -> None:
@@ -580,7 +583,7 @@ async def load_sports_quota_state(conn) -> None:
         _sports_quota_exhausted = False
         _sports_quota_reset_date = today
         log.info("TheRundown: quota state loaded — fresh quota available")
-SPORTS_CACHE_TTL_SECONDS = 1800  # 30 minutes — keeps usage ~60% of daily limit
+SPORTS_CACHE_TTL_SECONDS = 14400  # 4 hours — drastically reduces daily API calls
 # ── AUTO-TRADING NOTE ─────────────────────────────────────────────────────────
 # When auto-trading is enabled, reduce this to 300 (5 min) or 900 (15 min).
 # Rationale: Polymarket typically lags Vegas line moves by 15-60 min. At 30min
@@ -650,6 +653,15 @@ async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
         _sports_quota_exhausted = False
         _sports_quota_reset_date = today
 
+    # Daily call counter — hard cap to prevent quota exhaustion
+    global _sports_daily_calls, _sports_daily_calls_date
+    if _sports_daily_calls_date != today:
+        _sports_daily_calls = 0
+        _sports_daily_calls_date = today
+    if _sports_daily_calls >= SPORTS_DAILY_CALL_LIMIT:
+        log.warning("TheRundown: daily call limit (%d) reached — skipping until tomorrow", SPORTS_DAILY_CALL_LIMIT)
+        return []
+
     cached = _sports_odds_cache.get(sport_key)
     if cached:
         age = (now() - cached["fetched_at"]).total_seconds()
@@ -677,7 +689,9 @@ async def prefetch_sports_odds(sport_key: str, odds_api_key: str) -> list:
                     # Filter out games with no usable odds
                     games = [g for g in games if g["odds"]]
                     _sports_odds_cache[sport_key] = {"games": games, "fetched_at": now()}
-                    log.info("TheRundown prefetch OK: %s (%d games with odds)", sport_key, len(games))
+                    _sports_daily_calls += 1
+                    log.info("TheRundown prefetch OK: %s (%d games with odds) [call %d/%d today]",
+                             sport_key, len(games), _sports_daily_calls, SPORTS_DAILY_CALL_LIMIT)
                     return games
                 elif resp.status == 401:
                     log.error("TheRundown: 401 — invalid API key (check THERUNDOWN_API_KEY in Railway)")

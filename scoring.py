@@ -40,19 +40,21 @@ def detect_category(question):
         "bitcoin", "btc", "ethereum", "crypto",
         "solana", "xrp", "ripple",
         # Additional coins common on Polymarket
-        "dogecoin", "doge", "pepe", "avalanche", "avax",
+        "dogecoin", "doge", "pepe", "avax",  # removed "avalanche" — also an NHL team, use "avax" ticker only
         "polygon", "matic", "shiba", "shib", "chainlink",
         "binance coin", "bnb coin", "uniswap", "litecoin",
-        "cardano", "ada", "polkadot", "dot",
+        "cardano", "polkadot",
+        # "ada" and "dot" removed — match inside common words (Rivadavia, Granada, adopted)
+        # caught by word boundary regex below instead
     ]
     if any(w in q for w in crypto_explicit):
         return "Crypto"
 
-    # Short tickers need word boundaries to avoid false positives:
-    # "eth" matches "whether", "method", "Seth", "abeth"
-    # "sol" matches "Sola", "solar", "console", "solution"
-    # "bnb" matches "bnb" only (rare in non-crypto context, but still safer)
-    if re.search(r'\b(eth|sol|bnb|link)\b', q):
+    # Short tickers with word boundaries — prevents false positives
+    # "ada" matches "Rivadavia", "Granada", "Canada"
+    # "dot" matches "adopted", "endothermic"
+    # "dai" matches "daily", "median"
+    if re.search(r'\b(eth|sol|bnb|link|ada|dot|dai)\b', q):
         return "Crypto"
 
     # ── Sports detection ──────────────────────────────────────────────────────
@@ -460,9 +462,10 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
         flags.extend(inconsistencies)
 
     # ── GENERAL market type bonus ──────────────────────────────────────────────
-    # Live trade data: GENERAL markets 47.1% win rate vs PRICE_TARGET 22.1%.
+    # Live trade data: GENERAL Crypto markets 47.1% win rate vs PRICE_TARGET 22.1%.
     # "Bitcoin Up or Down" style markets win nearly 50% — strong signal.
-    if market_type == "GENERAL":
+    # Gated to Crypto only — Sports/Politics GENERAL markets are different.
+    if market_type == "GENERAL" and category == "Crypto":
         score += 8
         confirming += 1
         flags.append("GENERAL_MARKET: historically 47% win rate on live trades")
