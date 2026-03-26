@@ -123,6 +123,36 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
     if research:
         msg += "\n" + research + "\n"
 
+    # Category-specific context
+    cat = opp.get("category", "General")
+    mtype = opp.get("market_type", "GENERAL")
+    dtr = opp.get("days_to_resolution")
+    vol = opp.get("volume", 0)
+
+    if cat == "Economics":
+        msg += "\n<b>📈 Economics Context:</b>\n"
+        msg += "  Watch for: FOMC statements, jobs data, CPI releases\n"
+        if dtr is not None:
+            msg += f"  Resolves in: {dtr}d\n"
+    elif cat == "Politics":
+        msg += "\n<b>🗳 Politics Context:</b>\n"
+        msg += "  Watch for: polling shifts, official announcements\n"
+        if dtr is not None:
+            msg += f"  Resolves in: {dtr}d\n"
+    elif cat == "Science":
+        msg += "\n<b>🔬 Science Context:</b>\n"
+        msg += "  Watch for: official announcements, trial results\n"
+        if dtr is not None:
+            msg += f"  Resolves in: {dtr}d\n"
+    elif cat == "Sports" and not research:
+        msg += "\n<b>🏆 Sports Context:</b>\n"
+        msg += "  No Vegas odds available — trade with caution\n"
+    elif cat == "Crypto":
+        if mtype == "GENERAL":
+            msg += "\n<b>💡 Tip:</b> GENERAL crypto — historically 47% win rate on live trades\n"
+        elif mtype == "PRICE_TARGET":
+            msg += "\n<b>💡 Tip:</b> PRICE_TARGET — bot edge strongest at 10-30¢ entry\n"
+
     msg += "\nDo you agree this looks interesting?"
 
     reply_markup = {

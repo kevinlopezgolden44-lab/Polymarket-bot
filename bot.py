@@ -601,7 +601,13 @@ async def main():
                     category = result["category"]
                     market_age = result["signals"].get("age_hours")
 
-                    if score < CONFIG["log_opportunity_threshold"]:
+                    # Lower logging threshold for non-Crypto categories
+                    # so we build shadow data without taking real trades.
+                    # Crypto uses standard threshold (40). Others use 30.
+                    _log_threshold = CONFIG["log_opportunity_threshold"]
+                    if category != "Crypto":
+                        _log_threshold = 30
+                    if score < _log_threshold:
                         continue
 
                     question = market.get("question", "Unknown")
