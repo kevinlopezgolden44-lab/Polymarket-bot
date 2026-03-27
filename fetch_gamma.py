@@ -1,14 +1,17 @@
 """
-Polymarket Historical Data Fetcher — v8
-All fixes applied:
-- TRUNCATES on fresh start, RESUMES on restart (checks DB first)
-- Resumes from oldest stored date, not from end_max
-- No volume floor — collect all crypto markets
-- initial_price fallback to 0.5 if bid/ask missing (fixes old market rejection)
-- Expanded crypto terms to catch older market phrasings
-- No MAX_PAGES limit — stops only when date window is exhausted
+Polymarket Historical Data Fetcher — v9
+
+Key changes from v8:
+- NO category filter — collects ALL categories (Crypto, Sports, Politics, Economics, Science)
+- Filters multi-outcome markets (len(outcomePrices) > 2) — these corrupt binary analysis
+- Stores additional fields: num_outcomes, raw_category_gamma, market_age_days,
+  question_word_count, initial_spread
+- 6 month windows: Primary Oct 2025-Mar 2026, Validation Apr-Sep 2025
+  (back-to-back periods, same regime, clean comparison)
+- Resume logic: picks up from oldest stored date on restart
 - DB keepalive every 200 pages
-- Summary uses Python math, no SQL ROUND/AVG type errors
+- No MAX_PAGES — stops only when date window exhausted
+- Summary uses Python math (no SQL ROUND type errors)
 """
 
 import asyncio
@@ -28,37 +31,22 @@ log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
-PAGE_SIZE  = 100
-RATE_DELAY = 0.1
-
-CRYPTO_TERMS = [
-    # Major coins
-    "bitcoin", "btc", "ethereum", "eth", "crypto",
-    "solana", "xrp", "ripple", "dogecoin", "doge",
-    "pepe", "avalanche", "avax", "polygon", "matic",
-    "shiba", "shib", "chainlink", "cardano", "ada",
-    "polkadot", "bnb", "litecoin", "uniswap",
-    # Older market phrasings
-    "defi", "nft", "web3", "stablecoin", "usdc", "usdt",
-    "tether", "dai", "wbtc", "wrapped bitcoin",
-    "altcoin", "memecoin", "token", "coin price",
-    "market cap", "dominance", "halving", "blockchain",
-    "cryptocurrency", "crypto market",
-]
+GAMMA_BASE  = "https://gamma-api.polymarket.com/markets"
+PAGE_SIZE   = 100
+RATE_DELAY  = 0.1
 
 DATASETS = [
     {
-        "label":        "Primary (ended Apr 2025 - Mar 2026)",
+        "label":        "Primary (Oct 2025 - Mar 2026)",
         "dataset":      "primary",
-        "end_date_min": "2025-04-01",
+        "end_date_min": "2025-10-01",
         "end_date_max": "2026-03-20",
     },
     {
-        "label":        "Validation (ended Jan 2024 - Mar 2025)",
+        "label":        "Validation (Apr 2025 - Sep 2025)",
         "dataset":      "validation",
-        "end_date_min": "2024-01-01",
-        "end_date_max": "2025-04-01",
+        "end_date_min": "2025-04-01",
+        "end_date_max": "2025-09-30",
     },
 ]
 
@@ -68,12 +56,14 @@ DATASETS = [
 # ─────────────────────────────────────────────
 
 async def init_table(conn):
+    """Create table with all fields. Safe to run repeatedly."""
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS historical_markets (
             id                       SERIAL PRIMARY KEY,
             market_id                TEXT NOT NULL UNIQUE,
             question                 TEXT NOT NULL,
-            raw_category             TEXT,
+            raw_category             TEXT,       -- our detect_category result
+            raw_category_gamma       TEXT,       -- Polymarket's own category label
             dataset                  TEXT NOT NULL,
             created_at               TIMESTAMP,
             end_date                 TIMESTAMP,
@@ -81,19 +71,30 @@ async def init_table(conn):
             initial_bid              FLOAT,
             initial_ask              FLOAT,
             initial_price            FLOAT,
+            initial_spread           FLOAT,      -- ask - bid at fetch time
             resolution_price         FLOAT,
-            resolved_yes             INTEGER,
+            resolved_yes             INTEGER,    -- 1=YES, 0=NO
+            num_outcomes             INTEGER,    -- 2=binary, >2=multi-outcome (filtered)
             total_volume_usd         FLOAT,
             volume_24h_usd           FLOAT,
             time_to_resolution_hours FLOAT,
+            market_age_days          FLOAT,      -- endDate - startDate in days
+            question_word_count      INTEGER,    -- proxy for question complexity
             fetched_at               TIMESTAMP NOT NULL
         )
     """)
-    for col, typedef in [
-        ("end_date_str", "TEXT"),
-        ("volume_24h_usd", "FLOAT"),
+    # Safe migrations for tables created by earlier versions
+    migrations = [
+        ("raw_category_gamma",   "TEXT"),
+        ("initial_spread",       "FLOAT"),
+        ("num_outcomes",         "INTEGER"),
+        ("market_age_days",      "FLOAT"),
+        ("question_word_count",  "INTEGER"),
+        ("end_date_str",         "TEXT"),
+        ("volume_24h_usd",       "FLOAT"),
         ("time_to_resolution_hours", "FLOAT"),
-    ]:
+    ]
+    for col, typedef in migrations:
         await conn.execute(
             f"ALTER TABLE historical_markets ADD COLUMN IF NOT EXISTS {col} {typedef}"
         )
@@ -112,13 +113,14 @@ def parse_price(val):
 
 
 def parse_outcome_prices(val):
+    """Returns (yes_price, num_outcomes)."""
     try:
         prices = json.loads(val) if isinstance(val, str) else val
         if not prices or not isinstance(prices, list):
-            return None
-        return float(prices[0])
+            return None, 0
+        return float(prices[0]), len(prices)
     except Exception:
-        return None
+        return None, 0
 
 
 def parse_dt(val):
@@ -132,19 +134,22 @@ def parse_dt(val):
 
 
 def parse_market(m, dataset):
-    yes_p = parse_outcome_prices(m.get("outcomePrices"))
-    bid   = parse_price(m.get("bestBid"))
-    ask   = parse_price(m.get("bestAsk"))
+    yes_p, num_outcomes = parse_outcome_prices(m.get("outcomePrices"))
+    bid = parse_price(m.get("bestBid"))
+    ask = parse_price(m.get("bestAsk"))
 
     # Initial price: bid/ask mid preferred, fallback to yes_p, then 0.5
     if bid is not None and ask is not None and 0 < bid < ask:
         initial_price = round((bid + ask) / 2, 4)
+        initial_spread = round(ask - bid, 4)
     elif yes_p is not None:
         initial_price = yes_p
+        initial_spread = None
     else:
-        initial_price = 0.5  # fallback for old markets without bid/ask
+        initial_price = 0.5
+        initial_spread = None
 
-    # Resolution outcome
+    # Resolution outcome — only valid for binary markets
     resolved_yes = None
     if (m.get("resolved") or m.get("closed")) and yes_p is not None:
         if yes_p >= 0.90:
@@ -156,14 +161,22 @@ def parse_market(m, dataset):
     end_date     = parse_dt(m.get("endDate"))
     end_date_str = end_date.strftime("%Y-%m-%d") if end_date else None
 
-    duration = None
+    # Market duration
+    time_to_res = None
+    market_age_days = None
     if created_at and end_date and end_date > created_at:
-        duration = round((end_date - created_at).total_seconds() / 3600, 1)
+        delta_hours = (end_date - created_at).total_seconds() / 3600
+        time_to_res = round(delta_hours, 1)
+        market_age_days = round(delta_hours / 24, 1)
+
+    question = m.get("question", "")
+    word_count = len(question.split()) if question else 0
 
     return {
         "market_id":               str(m.get("id", "")),
-        "question":                m.get("question", ""),
-        "raw_category":            m.get("category", ""),
+        "question":                question,
+        "raw_category":            None,          # filled by detect_category below
+        "raw_category_gamma":      m.get("category", ""),  # Polymarket's own label
         "dataset":                 dataset,
         "created_at":              created_at,
         "end_date":                end_date,
@@ -171,18 +184,75 @@ def parse_market(m, dataset):
         "initial_bid":             bid,
         "initial_ask":             ask,
         "initial_price":           initial_price,
+        "initial_spread":          initial_spread,
         "resolution_price":        yes_p,
         "resolved_yes":            resolved_yes,
+        "num_outcomes":            num_outcomes,
         "total_volume_usd":        parse_price(m.get("volumeNum") or m.get("volume")),
         "volume_24h_usd":          parse_price(m.get("volume24hr")),
-        "time_to_resolution_hours": duration,
+        "time_to_resolution_hours": time_to_res,
+        "market_age_days":         market_age_days,
+        "question_word_count":     word_count,
         "fetched_at":              datetime.utcnow(),
     }
 
 
-def is_crypto(question):
-    q = question.lower()
-    return any(t in q for t in CRYPTO_TERMS)
+def is_valid(p, end_min, end_max):
+    """Quality filters."""
+    if not p["market_id"] or not p["question"]:
+        return False, "no_id"
+    if p["resolved_yes"] is None:
+        return False, "no_outcome"
+    if p["initial_price"] is None:
+        return False, "no_price"
+
+    # Filter multi-outcome markets — binary only
+    # Multi-outcome: "Will Powell say inflation 0-10, 11-20, 21-30 times?"
+    # These corrupt binary win rate analysis
+    if p["num_outcomes"] != 2:
+        return False, "multi_outcome"
+
+    # Date filter on end date
+    d = p["end_date_str"]
+    if d:
+        if d > end_max:
+            return False, "future"
+        if d < end_min:
+            return False, "too_old"
+
+    return True, None
+
+
+# ─────────────────────────────────────────────
+# Category detection (imported from scoring.py)
+# ─────────────────────────────────────────────
+
+try:
+    from scoring import detect_category
+    log.info("Loaded detect_category from scoring.py")
+except ImportError:
+    log.warning("Could not import scoring.py — using fallback category detection")
+    import re
+    def detect_category(question):
+        q = question.lower()
+        if any(w in q for w in ["bitcoin","btc","ethereum","crypto","solana","xrp","doge"]):
+            return "Crypto"
+        if re.search(r'\b(eth|sol|bnb)\b', q):
+            return "Crypto"
+        if " vs " in q or " vs. " in q:
+            return "Sports"
+        if re.search(r'\b(nba|nfl|mlb|nhl|ufc)\b', q):
+            return "Sports"
+        if any(w in q for w in ["election","president","trump","biden","senate","congress",
+                                  "tariff","ceasefire","nato","vote","democrat","republican"]):
+            return "Politics"
+        if any(w in q for w in ["fed","inflation","cpi","gdp","fomc","interest rate",
+                                  "recession","unemployment","s&p","nasdaq","powell"]):
+            return "Economics"
+        if any(w in q for w in ["fda","vaccine","spacex","nasa","cancer","ai model",
+                                  "openai","gpt","climate","drug trial","approval"]):
+            return "Science"
+        return "General"
 
 
 # ─────────────────────────────────────────────
@@ -206,9 +276,7 @@ async def fetch_page(session, offset, headers):
                 log.warning("Rate limited — waiting 10s")
                 await asyncio.sleep(10)
                 return []
-            else:
-                log.warning("API status %d", resp.status)
-                return []
+            return []
     except Exception as e:
         log.warning("Fetch error at offset %d: %s", offset, e)
         return []
@@ -216,7 +284,7 @@ async def fetch_page(session, offset, headers):
 
 async def binary_search_start(session, headers, target_date):
     """Find the page where end dates first go <= target_date."""
-    log.info("Binary search for date window (target=%s)...", target_date)
+    log.info("Binary search for %s...", target_date)
     lo, hi = 0, 600
     best = 0
     for _ in range(12):
@@ -227,8 +295,7 @@ async def binary_search_start(session, headers, target_date):
             continue
         dates = [
             parse_dt(m.get("endDate")).strftime("%Y-%m-%d")
-            for m in markets
-            if parse_dt(m.get("endDate"))
+            for m in markets if parse_dt(m.get("endDate"))
         ]
         if not dates:
             hi = mid
@@ -267,7 +334,7 @@ async def fetch_and_store(conn, cfg, session, headers):
     )
     log.info("Already in DB: %d", existing)
 
-    # Resume from oldest stored date, not from end_max
+    # Resume from oldest stored date
     resume_target = end_max
     if existing > 0:
         oldest_stored = await conn.fetchval(
@@ -275,16 +342,16 @@ async def fetch_and_store(conn, cfg, session, headers):
         )
         if oldest_stored and oldest_stored > end_min:
             resume_target = oldest_stored
-            log.info("Resuming from: %s (oldest stored date)", resume_target)
+            log.info("Resuming from: %s", resume_target)
         else:
-            log.info("DB covers full range already — nothing to fetch")
+            log.info("Dataset already complete")
             return
 
-    start_page     = await binary_search_start(session, headers, resume_target)
-    page           = start_page
-    pages_fetched  = 0
-    total_stored   = 0
-    skip_reasons   = {}
+    start_page       = await binary_search_start(session, headers, resume_target)
+    page             = start_page
+    pages_fetched    = 0
+    total_stored     = 0
+    skip_reasons     = {}
     consecutive_past = 0
 
     while True:
@@ -302,47 +369,39 @@ async def fetch_and_store(conn, cfg, session, headers):
             if p["end_date_str"]:
                 page_dates.append(p["end_date_str"])
 
-            # Validity checks
-            if not p["market_id"] or not p["question"]:
-                skip_reasons["no_id"] = skip_reasons.get("no_id", 0) + 1
-                continue
-            if p["resolved_yes"] is None:
-                skip_reasons["no_outcome"] = skip_reasons.get("no_outcome", 0) + 1
-                continue
+            # Apply detect_category
+            p["raw_category"] = detect_category(p["question"])
 
-            # Crypto filter
-            if not is_crypto(p["question"]):
-                skip_reasons["non_crypto"] = skip_reasons.get("non_crypto", 0) + 1
+            valid, reason = is_valid(p, end_min, end_max)
+            if not valid:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 continue
-
-            # Date filter
-            d = p["end_date_str"]
-            if d:
-                if d > end_max:
-                    skip_reasons["future"] = skip_reasons.get("future", 0) + 1
-                    continue
-                if d < end_min:
-                    skip_reasons["too_old"] = skip_reasons.get("too_old", 0) + 1
-                    continue
 
             try:
                 await conn.execute("""
                     INSERT INTO historical_markets (
-                        market_id, question, raw_category, dataset,
-                        created_at, end_date, end_date_str,
-                        initial_bid, initial_ask, initial_price,
-                        resolution_price, resolved_yes,
+                        market_id, question, raw_category, raw_category_gamma,
+                        dataset, created_at, end_date, end_date_str,
+                        initial_bid, initial_ask, initial_price, initial_spread,
+                        resolution_price, resolved_yes, num_outcomes,
                         total_volume_usd, volume_24h_usd,
-                        time_to_resolution_hours, fetched_at
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                        time_to_resolution_hours, market_age_days,
+                        question_word_count, fetched_at
+                    ) VALUES (
+                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                        $13,$14,$15,$16,$17,$18,$19,$20,$21
+                    )
                     ON CONFLICT (market_id) DO NOTHING
                 """,
-                    p["market_id"], p["question"], p["raw_category"], p["dataset"],
-                    p["created_at"], p["end_date"], p["end_date_str"],
-                    p["initial_bid"], p["initial_ask"], p["initial_price"],
-                    p["resolution_price"], p["resolved_yes"],
+                    p["market_id"], p["question"],
+                    p["raw_category"], p["raw_category_gamma"],
+                    p["dataset"], p["created_at"], p["end_date"], p["end_date_str"],
+                    p["initial_bid"], p["initial_ask"],
+                    p["initial_price"], p["initial_spread"],
+                    p["resolution_price"], p["resolved_yes"], p["num_outcomes"],
                     p["total_volume_usd"], p["volume_24h_usd"],
-                    p["time_to_resolution_hours"], p["fetched_at"]
+                    p["time_to_resolution_hours"], p["market_age_days"],
+                    p["question_word_count"], p["fetched_at"]
                 )
                 page_stored += 1
                 total_stored += 1
@@ -354,7 +413,7 @@ async def fetch_and_store(conn, cfg, session, headers):
         log.info("Page %d | stored=%d | total=%d | dates=%s→%s | skips=%s",
                  page, page_stored, total_stored, min_d, max_d, skip_reasons)
 
-        # Stop when past the date window
+        # Stop when past the window
         if page_dates and all(d < end_min for d in page_dates):
             consecutive_past += 1
             if consecutive_past >= 3:
@@ -399,13 +458,27 @@ async def fetch_and_store(conn, cfg, session, headers):
     newest = await conn.fetchval(
         "SELECT MAX(end_date_str) FROM historical_markets WHERE dataset=$1", dataset
     )
-    yes_rate = round((yes_count or 0) / final * 100, 1) if final else 0
 
+    # Category breakdown
+    cat_rows = await conn.fetch("""
+        SELECT raw_category, COUNT(*) as n,
+               SUM(resolved_yes) as wins
+        FROM historical_markets
+        WHERE dataset=$1
+        GROUP BY raw_category
+        ORDER BY n DESC
+    """, dataset)
+
+    yes_rate = round((yes_count or 0) / final * 100, 1) if final else 0
     log.info("─" * 55)
     log.info("Done: %s", label)
-    log.info("Total in DB: %d | YES rate: %.1f%%", final, yes_rate)
-    log.info("Date range:  %s → %s", oldest, newest)
+    log.info("Total: %d | YES rate: %.1f%%", final, yes_rate)
+    log.info("Date range: %s → %s", oldest, newest)
     log.info("Skip reasons: %s", skip_reasons)
+    log.info("Category breakdown:")
+    for r in cat_rows:
+        cat_wr = round((r["wins"] or 0) / r["n"] * 100, 1) if r["n"] else 0
+        log.info("  %-12s n=%6d  WR=%.1f%%", r["raw_category"], r["n"], cat_wr)
     log.info("─" * 55)
 
 
@@ -421,12 +494,11 @@ async def main():
     conn = await asyncpg.connect(DATABASE_URL)
     await init_table(conn)
 
-    # Check if this is a fresh start or a resume
     total_existing = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
     if total_existing == 0:
-        log.info("Fresh start — no existing data")
+        log.info("Fresh start")
     else:
-        log.info("Resuming — %d records already in DB", total_existing)
+        log.info("Resuming — %d records in DB", total_existing)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -435,7 +507,6 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         for cfg in DATASETS:
-            # Reconnect before each dataset
             try:
                 await conn.execute("SELECT 1")
             except Exception:

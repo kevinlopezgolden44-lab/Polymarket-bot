@@ -331,44 +331,28 @@ def compare_datasets(p_cats, v_cats, label):
         print(f"  {str(key):<18} {p_str:>12} {v_str:>14} {stable:>8}")
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 
 
 def analyze_category_deep(rows, label):
-    """
-    Deep per-category analysis:
-    - Win rate by category
-    - Optimal score threshold per category
-    - Entry price distribution per category
-    - Whether category scoring threshold should differ from 85
-    """
+    """Per-category: win rate, entry price, optimal threshold, market type."""
     section(f"Category Deep Dive — {label}")
-
     categories = {}
     for r in rows:
         c = r["category"]
         categories.setdefault(c, [])
         categories[c].append(r)
-
     for cat, cat_rows in sorted(categories.items(), key=lambda x: -len(x[1])):
         total = len(cat_rows)
         if total < 10:
             print(f"\n  {cat}: {total} markets — too few for analysis")
             continue
-
         wins = sum(r["resolved_yes"] for r in cat_rows)
         wr   = wins / total * 100
-
         print(f"\n  {'─'*60}")
-        print(f"  {cat} — {total:,} markets | Win Rate: {wr:.1f}% | "
-              f"Break-even: 33.3%")
+        print(f"  {cat} — {total:,} markets | WR: {wr:.1f}% | Break-even: 33.3%")
         print(f"  {'─'*60}")
-
-        # Entry price within category
-        bins = [(0.10,0.30,"10-30c"), (0.30,0.50,"30-50c"),
-                (0.50,0.70,"50-70c"), (0.70,0.96,"70-96c")]
+        bins = [(0.05,0.20,"5-20c"),(0.20,0.40,"20-40c"),
+                (0.40,0.60,"40-60c"),(0.60,0.80,"60-80c"),(0.80,1.0,"80c+")]
         print(f"  {'Price':<10} {'Total':>7} {'Wins':>7} {'Win%':>8}")
         for lo, hi, lbl in bins:
             sub = [r for r in cat_rows if lo <= r["initial_price"] < hi]
@@ -376,10 +360,9 @@ def analyze_category_deep(rows, label):
             sub_wr = sum(r["resolved_yes"] for r in sub) / len(sub) * 100
             flag = " ✅" if sub_wr > 33.3 else " ❌"
             print(f"  {lbl:<10} {len(sub):>7,} {sum(r['resolved_yes'] for r in sub):>7} {sub_wr:>7.1f}%{flag}")
-
-        # Optimal threshold for this category
-        print(f"  Threshold analysis:")
+        # Threshold analysis
         best_t, best_t_wr, best_t_n = 60, 0, 0
+        threshold_lines = []
         for thresh in range(60, 96, 5):
             sub = [r for r in cat_rows if r["score"] >= thresh]
             if len(sub) < 5: continue
@@ -387,12 +370,14 @@ def analyze_category_deep(rows, label):
             marker = " ← CURRENT" if thresh == 85 else ""
             if sub_wr > best_t_wr and len(sub) >= 10:
                 best_t, best_t_wr, best_t_n = thresh, sub_wr, len(sub)
-            print(f"    Score≥{thresh}: {len(sub):>6,} markets | {sub_wr:.1f}% WR{marker}")
-
+            threshold_lines.append(f"    Score≥{thresh}: {len(sub):>6,} | {sub_wr:.1f}% WR{marker}")
+        if threshold_lines:
+            print(f"  Threshold analysis:")
+            for line in threshold_lines:
+                print(line)
         rec = "RAISE" if best_t > 85 else "LOWER" if best_t < 85 else "KEEP"
-        print(f"  → Recommended threshold: {best_t} ({best_t_wr:.1f}% WR, n={best_t_n}) — {rec} from 85")
-
-        # Market type within category
+        print(f"  → Recommended: {best_t} ({best_t_wr:.1f}% WR, n={best_t_n}) — {rec} from 85")
+        # Market type
         types = {}
         for r in cat_rows:
             t = r["market_type"]
@@ -406,44 +391,73 @@ def analyze_category_deep(rows, label):
                 print(f"    {t:<18} n={d['total']:>5,} WR={t_wr:.1f}%")
 
 
-async def main():
-    print("\n🚀 Backtest starting...")
-    print(f"   DATABASE_URL set: {bool(DATABASE_URL)}")
+def analyze_resolution_time(rows, label):
+    """Win rate by days to resolution."""
+    section(f"Win Rate by Resolution Time — {label}")
+    bins = [(0,1,"<1d"),(1,3,"1-3d"),(3,7,"3-7d"),(7,14,"7-14d"),
+            (14,30,"14-30d"),(30,90,"30-90d"),(90,9999,"90d+")]
+    print(f"\n  {'Duration':<12} {'Total':>8} {'Wins':>8} {'Win Rate':>10}")
+    print(f"  {'-'*42}")
+    for lo, hi, lbl in bins:
+        subset = [r for r in rows
+                  if r.get("time_to_resolution_hours") is not None
+                  and lo*24 <= r["time_to_resolution_hours"] < hi*24]
+        if not subset: continue
+        wins = sum(r["resolved_yes"] for r in subset)
+        wr = wins/len(subset)*100
+        flag = " ✅" if wr > 33.3 else " ❌"
+        print(f"  {lbl:<12} {len(subset):>8,} {wins:>8} {wr:>9.1f}%{flag}")
 
+
+def analyze_volume_tiers(rows, label):
+    """Win rate by volume tier."""
+    section(f"Win Rate by Volume Tier — {label}")
+    bins = [(0,100,"<$100"),(100,500,"$100-500"),(500,1000,"$500-1k"),
+            (1000,5000,"$1k-5k"),(5000,10000,"$5k-10k"),
+            (10000,50000,"$10k-50k"),(50000,9999999,"$50k+")]
+    print(f"\n  {'Volume':<14} {'Total':>8} {'Wins':>8} {'Win Rate':>10}")
+    print(f"  {'-'*44}")
+    for lo, hi, lbl in bins:
+        subset = [r for r in rows
+                  if r.get("total_volume_usd") is not None
+                  and lo <= r["total_volume_usd"] < hi]
+        if not subset: continue
+        wins = sum(r["resolved_yes"] for r in subset)
+        wr = wins/len(subset)*100
+        flag = " ✅" if wr > 33.3 else " ❌"
+        print(f"  {lbl:<14} {len(subset):>8,} {wins:>8} {wr:>9.1f}%{flag}")
+
+
+def analyze_gamma_vs_detected(rows, label):
+    """Compare Polymarket's own category vs our detected category."""
+    section(f"Polymarket Category vs Our Detection — {label}")
+    mismatches = {}
+    for r in rows:
+        gamma = r.get("raw_category_gamma") or "Unknown"
+        ours  = r.get("category") or "Unknown"
+        if gamma and gamma.strip() and gamma != ours:
+            key = f"{gamma} → {ours}"
+            mismatches[key] = mismatches.get(key, 0) + 1
+    if not mismatches:
+        print("\n  No mismatches (or raw_category_gamma not yet populated in DB)")
+        print("  This will show data after next fetch_gamma.py run")
+        return
+    print(f"\n  {'Polymarket → Ours':<35} {'Count':>8}")
+    print(f"  {'-'*45}")
+    for k, v in sorted(mismatches.items(), key=lambda x: -x[1])[:20]:
+        print(f"  {k:<35} {v:>8,}")
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+async def main():
     if not DATABASE_URL:
         log.error("DATABASE_URL not set")
         return
 
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        print("   DB connected ✅")
-    except Exception as e:
-        log.error("DB connection failed: %s", e)
-        return
-
-    # Diagnostic: show what's in the table before filtering
-    try:
-        total = await conn.fetchval("SELECT COUNT(*) FROM historical_markets")
-        print(f"   Total rows in historical_markets: {total:,}")
-
-        with_outcome = await conn.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE resolved_yes IS NOT NULL"
-        )
-        print(f"   Rows with outcome: {with_outcome:,}")
-
-        with_price = await conn.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE initial_price IS NOT NULL"
-        )
-        print(f"   Rows with price: {with_price:,}")
-
-        with_vol = await conn.fetchval(
-            "SELECT COUNT(*) FROM historical_markets WHERE total_volume_usd >= 100"
-        )
-        print(f"   Rows with volume >= $100: {with_vol:,}")
-    except Exception as e:
-        log.error("Diagnostic query failed: %s", e)
-        await conn.close()
-        return
+    conn = await asyncpg.connect(DATABASE_URL)
 
     # Check data exists
     counts = await conn.fetch("""
@@ -459,23 +473,28 @@ async def main():
     for row in counts:
         log.info("Dataset '%s': %d markets", row["dataset"], row["n"])
 
-    # Load all markets — relaxed filters to maximise data
-    # Use $100 volume floor (not $1000) and allow full price range
+    # Load all markets — relaxed filters, exclude multi-outcome markets
     raw = await conn.fetch("""
         SELECT market_id, question, raw_category, dataset,
                initial_bid, initial_ask, initial_price,
+               COALESCE(initial_spread, 0) as initial_spread,
                resolution_price, resolved_yes,
+               COALESCE(num_outcomes, 2) as num_outcomes,
                total_volume_usd, volume_24h_usd,
-               time_to_resolution_hours
+               time_to_resolution_hours,
+               COALESCE(market_age_days, 0) as market_age_days,
+               COALESCE(question_word_count, 0) as question_word_count,
+               COALESCE(raw_category_gamma, '') as raw_category_gamma
         FROM historical_markets
         WHERE resolved_yes IS NOT NULL
           AND initial_price IS NOT NULL
           AND initial_price BETWEEN 0.05 AND 0.99
           AND (total_volume_usd IS NULL OR total_volume_usd >= 100)
+          AND (num_outcomes IS NULL OR num_outcomes = 2)
         ORDER BY dataset, initial_price
     """)
     await conn.close()
-    print(f"   Rows loaded for analysis: {len(raw):,}")
+    print(f"   Rows loaded: {len(raw):,}")
 
     log.info("Loaded %d markets from DB", len(raw))
 
@@ -517,6 +536,9 @@ async def main():
         best_thresh, best_wr = find_optimal_threshold(primary, "Primary")
         analyze_signals(primary, "Primary")
         analyze_category_deep(primary, "Primary")
+        analyze_resolution_time(primary, "Primary")
+        analyze_volume_tiers(primary, "Primary")
+        analyze_gamma_vs_detected(primary, "Primary")
 
     # ── Validation analysis ────────────────────────────────────
     v_cats = {}
@@ -534,6 +556,8 @@ async def main():
         find_optimal_threshold(validation, "Validation")
         analyze_signals(validation, "Validation")
         analyze_category_deep(validation, "Validation")
+        analyze_resolution_time(validation, "Validation")
+        analyze_volume_tiers(validation, "Validation")
 
     # ── Cross-dataset stability ────────────────────────────────
     if primary and validation:
