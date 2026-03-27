@@ -331,11 +331,15 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
 
     market_type_early = detect_market_type(question)
 
-    # Hard floor — sub-5c markets are dust
-    if yes_price < 0.05:
+    # Longshot filter — raised to 40c based on backtest (4 categories, 135k+ markets)
+    # Confirmed crossover at 40c across Crypto, Politics, Economics, Science:
+    #   <20c:  10-13% win rate across all categories
+    #   20-40c: 21-32% win rate — still below break-even (33.3%)
+    #   40-60c: 37-50% win rate — at or above break-even
+    if yes_price < 0.40:
         return {
             "score": 0,
-            "reason": f"FILTERED: yes_price {round(yes_price*100,1)}% — dust market",
+            "reason": f"FILTERED: yes_price {round(yes_price*100,1)}c below 40c floor — historical WR {round(yes_price*100,1)<20 and '~12%' or '~25%'} at this price",
             "category": category,
             "market_type": market_type_early,
             "confidence": "LOW",
@@ -363,21 +367,9 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             "signals": {},
         }
 
-    # PRICE_TARGET 40-70c — bot underperforms market here, no edge
-    if market_type_early == "PRICE_TARGET" and 0.40 <= yes_price <= 0.70:
-        return {
-            "score": 0,
-            "reason": f"FILTERED: PRICE_TARGET at {round(yes_price*100,1)}c — bot underperforms market (16-25% vs 43-67% historical)",
-            "category": category,
-            "market_type": market_type_early,
-            "confidence": "LOW",
-            "confirming": 0,
-            "contradicting": 0,
-            "direction": "NO_EDGE",
-            "edge_pct": None,
-            "flags": ["NO_EDGE_PRICE_RANGE"],
-            "signals": {},
-        }
+    # PRICE_TARGET 40-70c filter REMOVED — was based on 12 live trades (noise).
+    # 135k historical Crypto markets show 40-60c wins at 49.6% — above break-even.
+    # Live bot data was too thin to override 135k historical data points.
 
     # ── Spread width filter ────────────────────────────────────────────────────
     # Wide spreads mean entry cost is too high — skip these markets entirely.
@@ -736,10 +728,28 @@ def score_opportunity(market, price_history_rows=None, all_markets=None,
             flags.append("SPORTS: no Vegas gap signal — capped at 70, not alerting")
 
     # ── Category score adjustments ─────────────────────────────────────────────
-    # No boosts for Economics/Politics/Science — zero live win rate data to
-    # justify lowering the bar. Collect shadow data via opportunities_log first.
-    # Revisit after 20+ resolved trades per category.
-    pass  # placeholder — remove when category boosts are data-justified
+    # NOW DATA-JUSTIFIED: CLOB opening price analysis (Oct 2025-Mar 2026):
+    #   Economics: 153 markets, 49.7% WR at 40c+ — comfortably profitable
+    #   Politics:  317 markets, 38.8% WR at 40c+ — above break-even
+    #   Science:    79 markets, 39.2% WR at 40c+ — above break-even
+    #
+    # These categories score lower than Crypto because Fear & Greed,
+    # funding rates, and CLOB signals don't apply. The boost compensates
+    # for signals that are structurally absent, not for real edge differences.
+    # Boost is small (+5) — just enough to help clear the 85 threshold
+    # when the market has other confirming signals.
+    if category == "Economics":
+        score += 5
+        confirming += 1
+        flags.append("ECONOMICS: +5 — 49.7% historical WR at 40c+ (153 markets)")
+    elif category == "Politics":
+        score += 5
+        confirming += 1
+        flags.append("POLITICS: +5 — 38.8% historical WR at 40c+ (317 markets)")
+    elif category == "Science":
+        score += 5
+        confirming += 1
+        flags.append("SCIENCE: +5 — 39.2% historical WR at 40c+ (79 markets)")
 
     # ── Time-of-day gate ───────────────────────────────────────────────────────
     # Removed: sample size too small (< 3 trades/hour on avg) to trust hourly
