@@ -35,8 +35,8 @@ log = logging.getLogger(__name__)
 DATABASE_URL  = os.environ.get("DATABASE_URL")
 GAMMA_BASE    = "https://gamma-api.polymarket.com/markets"
 CLOB_BASE     = "https://clob.polymarket.com"
-RATE_DELAY    = 0.15   # seconds between requests
-BATCH_SIZE    = 50     # markets per batch
+RATE_DELAY    = 0.05   # reduced from 0.15 — CLOB API is fast
+BATCH_SIZE    = 200    # increased from 50 — fewer log lines, faster
 
 
 async def init_columns(conn):
@@ -204,7 +204,7 @@ async def main():
     # Count non-Crypto markets that need opening prices
     total = await conn.fetchval("""
         SELECT COUNT(*) FROM historical_markets
-        WHERE raw_category != 'Crypto'
+        WHERE raw_category IN ('Economics', 'Politics', 'Science')
           AND resolved_yes IS NOT NULL
           AND price_fetched_at IS NULL
     """)
@@ -219,7 +219,7 @@ async def main():
                    SUM(CASE WHEN opening_price IS NOT NULL THEN 1 ELSE 0 END) as with_price,
                    SUM(resolved_yes) as wins
             FROM historical_markets
-            WHERE raw_category != 'Crypto'
+            WHERE raw_category IN ('Economics', 'Politics', 'Science')
               AND resolved_yes IS NOT NULL
             GROUP BY raw_category
             ORDER BY total DESC
@@ -259,7 +259,7 @@ async def main():
     first_market = await conn.fetchrow("""
         SELECT market_id, created_at, raw_category
         FROM historical_markets
-        WHERE raw_category != 'Crypto'
+        WHERE raw_category IN ('Economics', 'Politics', 'Science')
           AND resolved_yes IS NOT NULL
           AND price_fetched_at IS NULL
         LIMIT 1
@@ -300,7 +300,7 @@ async def main():
             markets = await conn.fetch("""
                 SELECT market_id, created_at, raw_category
                 FROM historical_markets
-                WHERE raw_category != 'Crypto'
+                WHERE raw_category IN ('Economics', 'Politics', 'Science')
                   AND resolved_yes IS NOT NULL
                   AND price_fetched_at IS NULL
                 ORDER BY raw_category, market_id
