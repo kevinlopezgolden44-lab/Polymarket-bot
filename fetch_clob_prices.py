@@ -57,24 +57,56 @@ async def init_columns(conn):
 
 
 async def get_clob_token_id(session, market_id, headers):
-    """Fetch clobTokenIds for a market from Gamma API."""
-    url = f"{GAMMA_BASE}/{market_id}"
-    try:
-        async with session.get(
-            url, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status == 200:
+    """
+    Fetch clobTokenIds for a market from Gamma API.
+    Tries multiple URL formats since the API structure varies.
+    """
+    # Try query param format first (most reliable)
+    urls_to_try = [
+        f"{GAMMA_BASE}?id={market_id}",
+        f"{GAMMA_BASE}/{market_id}",
+    ]
+    for url in urls_to_try:
+        try:
+            async with session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    continue
                 data = await resp.json()
-                tokens = data.get("clobTokenIds") or data.get("tokens", [])
+
+                # Handle both list and dict responses
+                market = data[0] if isinstance(data, list) and data else data
+                if not isinstance(market, dict):
+                    continue
+
+                # Try different field names for token IDs
+                tokens = (market.get("clobTokenIds") or
+                          market.get("tokens") or
+                          market.get("tokenIds") or [])
+
                 if isinstance(tokens, str):
-                    tokens = json.loads(tokens)
+                    try:
+                        tokens = json.loads(tokens)
+                    except Exception:
+                        tokens = [tokens]
+
                 if tokens and len(tokens) > 0:
-                    return str(tokens[0])  # YES token ID
-            return None
-    except Exception as e:
-        log.warning("Gamma fetch error for %s: %s", market_id, e)
-        return None
+                    token_id = str(tokens[0])
+                    if len(token_id) > 10:  # valid token IDs are long hex strings
+                        return token_id
+
+                # Debug first few failures
+                if market_id == _debug_market_id:
+                    log.info("DEBUG market fields: %s", list(market.keys())[:15])
+
+        except Exception as e:
+            log.warning("Gamma fetch error for %s at %s: %s", market_id, url, e)
+            continue
+    return None
+
+_debug_market_id = None  # set to first market_id to debug
 
 
 async def get_opening_price(session, token_id, created_at, headers):
@@ -222,6 +254,42 @@ async def main():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
+
+    # Debug first market to verify API structure
+    first_market = await conn.fetchrow("""
+        SELECT market_id, created_at, raw_category
+        FROM historical_markets
+        WHERE raw_category != 'Crypto'
+          AND resolved_yes IS NOT NULL
+          AND price_fetched_at IS NULL
+        LIMIT 1
+    """)
+    if first_market:
+        global _debug_market_id
+        _debug_market_id = first_market["market_id"]
+        log.info("Debug market ID: %s (category: %s)",
+                 _debug_market_id, first_market["raw_category"])
+
+        # Quick test of both URL formats
+        import aiohttp as _aiohttp
+        async with _aiohttp.ClientSession() as _sess:
+            for _url in [
+                f"{GAMMA_BASE}?id={_debug_market_id}",
+                f"{GAMMA_BASE}/{_debug_market_id}",
+            ]:
+                try:
+                    async with _sess.get(_url, headers=headers,
+                                        timeout=_aiohttp.ClientTimeout(total=10)) as _r:
+                        log.info("  %s → status=%d", _url, _r.status)
+                        if _r.status == 200:
+                            _d = await _r.json()
+                            _m = _d[0] if isinstance(_d, list) and _d else _d
+                            if isinstance(_m, dict):
+                                log.info("  Fields: %s", list(_m.keys())[:15])
+                                log.info("  clobTokenIds: %s", _m.get("clobTokenIds"))
+                                log.info("  tokens: %s", str(_m.get("tokens", ""))[:80])
+                except Exception as _e:
+                    log.info("  %s → error: %s", _url, _e)
 
     offset = 0
     total_processed = 0
