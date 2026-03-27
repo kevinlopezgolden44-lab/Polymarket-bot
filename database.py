@@ -352,6 +352,7 @@ async def init_db(conn):
         ("volume_delta", "FLOAT"),
         ("volume_delta_signal", "TEXT"),
         ("market_direction", "TEXT"),
+        ("volume_at_entry", "FLOAT"),
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
@@ -452,10 +453,10 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
                            direction, edge_pct, vegas_gap, vegas_implied, spread,
                            suppressed, suppression_reason,
                            ob_imbalance, ob_signal, volume_delta, volume_delta_signal,
-                           market_direction)
+                           market_direction, volume_at_entry)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                 $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
+                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -489,6 +490,7 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         opportunity.get("volume_delta"),
         opportunity.get("volume_delta_signal"),
         opportunity.get("signals", {}).get("market_direction"),
+        opportunity.get("volume"),
     )
 
     await conn.execute("""
@@ -711,7 +713,8 @@ async def update_open_positions(pool):
                             loss_reason = derive_loss_reason(
                                 entry, current_price,
                                 float(pos.get("alert_entry") or entry),
-                                peak_price=pos["peak_price"]
+                                peak_price=pos["peak_price"],
+                                direction=pos.get("alert_direction"),
                             )
 
                         async with pool.acquire() as conn:
@@ -765,14 +768,20 @@ async def update_open_positions(pool):
     return closed
 
 
-def derive_loss_reason(entry, resolution_price, alert_yes_price, peak_price=None):
+def derive_loss_reason(entry, resolution_price, alert_yes_price, peak_price=None, direction=None):
     if resolution_price is None or entry is None or entry == 0:
         return None
 
     price_change_pct = abs(resolution_price - entry) / entry * 100
-    bet_yes = entry < 0.5
     resolved_yes = resolution_price >= 0.99
     resolved_no = resolution_price <= 0.01
+
+    # Use stored direction if available; fall back to entry price heuristic
+    # only for legacy alerts that predate the direction column.
+    if direction:
+        bet_yes = (direction == "BUY_YES")
+    else:
+        bet_yes = entry < 0.5
 
     if bet_yes and resolved_no:
         return "WRONG_DIRECTION"
@@ -893,7 +902,8 @@ async def check_resolutions(conn):
                                             loss_reason = derive_loss_reason(
                                                 entry, final_yes,
                                                 float(alert["yes_price"]),
-                                                peak_price=peak_p
+                                                peak_price=peak_p,
+                                                direction=alert.get("direction"),
                                             )
 
                                         vol_at_res = market.get("volume")

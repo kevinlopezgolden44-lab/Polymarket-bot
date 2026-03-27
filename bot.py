@@ -337,10 +337,12 @@ async def main():
 
     await send_message(
         TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-        "<b>Polymarket Bot v16 Started!</b>\n\n"
+        "<b>Polymarket Bot v17 Started!</b>\n\n"
         "Changes in this version:\n"
-        "Connection pooling — bot survives DB reconnects\n"
-        "Vegas gap now scores markets (not just shown in alerts)\n\n"
+        "• CLOB order book now fetched for ALL categories (was Crypto only)\n"
+        "• Price history tracked for all scored markets (better first-alert data)\n"
+        "• Loss reason classification uses stored direction\n"
+        "• Volume at entry now logged for future analysis\n\n"
         "Type /status to check stats!"
     )
 
@@ -565,18 +567,19 @@ async def main():
                             log.warning("Sports odds lookup error: %s", e)
 
                     # ── Fetch CLOB order book (real bid/ask sizes) ─────────────
+                    # CLOB API works for ALL Polymarket markets, not just Crypto.
+                    # Order book imbalance is a strong signal across every category.
                     _clob_data = None
-                    if category == "Crypto":
-                        try:
-                            clob_token_ids = market.get("clobTokenIds")
-                            if isinstance(clob_token_ids, str):
-                                import json as _j
-                                clob_token_ids = _j.loads(clob_token_ids)
-                            if clob_token_ids:
-                                _token_id = clob_token_ids[0]  # YES token
-                                _clob_data = await get_clob_order_book(str(_token_id))
-                        except Exception as _e:
-                            log.debug("CLOB fetch error: %s", _e)
+                    try:
+                        clob_token_ids = market.get("clobTokenIds")
+                        if isinstance(clob_token_ids, str):
+                            import json as _j
+                            clob_token_ids = _j.loads(clob_token_ids)
+                        if clob_token_ids:
+                            _token_id = clob_token_ids[0]  # YES token
+                            _clob_data = await get_clob_order_book(str(_token_id))
+                    except Exception as _e:
+                        log.debug("CLOB fetch error: %s", _e)
 
                     # ── Funding rate (from prefetch cache — instant) ────────────
                     _funding_data = None
@@ -714,9 +717,15 @@ async def main():
                     confirming = result.get("confirming", 0)
                     contradicting = result.get("contradicting", 0)
 
+                    # ── Price history — track ALL scored markets ────────────────
+                    # Previously only tracked alerted markets, meaning NEW markets
+                    # never had momentum/velocity data at first alert time.
+                    # Now we record price history for any market scoring >= log threshold.
+                    async with pool.acquire() as conn:
+                        await update_price_history(conn, market_id, yes_price)
+
                     if market_id in alerted_markets:
                         async with pool.acquire() as conn:
-                            await update_price_history(conn, market_id, yes_price)
                             history = await get_price_history(conn, market_id)
 
                         if history:

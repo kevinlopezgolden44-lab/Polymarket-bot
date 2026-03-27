@@ -231,22 +231,7 @@ async def get_funding_rate(question: str) -> dict:
                     rate = float(data.get("lastFundingRate", 0))
                     rate_pct = round(rate * 100, 4)  # convert to percentage
 
-                    # Classify signal
-                    if rate_pct <= -0.05:
-                        signal = "SHORTS_OVERCROWDED"   # strong upside lean
-                        score_bonus = 8
-                    elif rate_pct <= -0.01:
-                        signal = "MILD_BEARISH_FUNDING"  # mild upside lean
-                        score_bonus = 4
-                    elif rate_pct >= 0.05:
-                        signal = "LONGS_OVERCROWDED"    # strong downside lean
-                        score_bonus = 8   # bonus applied based on market direction in scoring.py
-                    elif rate_pct >= 0.01:
-                        signal = "MILD_BULLISH_FUNDING"  # mild downside lean
-                        score_bonus = 4
-                    else:
-                        signal = "NEUTRAL"
-                        score_bonus = 0
+                    signal, score_bonus = _classify_funding_rate(rate_pct)
 
                     result = {
                         "symbol": symbol,
@@ -263,6 +248,30 @@ async def get_funding_rate(question: str) -> dict:
     except Exception as e:
         log.warning("Binance funding rate error: %s", e)
     return {"success": False, "rate_pct": 0, "signal": "UNKNOWN", "score_bonus": 0}
+
+
+def _classify_funding_rate(rate_pct: float) -> tuple[str, int]:
+    """
+    Single source of truth for funding rate signal classification.
+    Returns (signal_name, score_bonus).
+
+    Thresholds:
+      <= -0.05%  SHORTS_OVERCROWDED  (strong upside lean)   bonus=8
+      <= -0.01%  MILD_BEARISH_FUNDING (mild upside lean)    bonus=4
+      >=  0.05%  LONGS_OVERCROWDED   (strong downside lean) bonus=8
+      >=  0.01%  MILD_BULLISH_FUNDING (mild downside lean)  bonus=4
+      else       NEUTRAL                                     bonus=0
+    """
+    if rate_pct <= -0.05:
+        return "SHORTS_OVERCROWDED", 8
+    elif rate_pct <= -0.01:
+        return "MILD_BEARISH_FUNDING", 4
+    elif rate_pct >= 0.05:
+        return "LONGS_OVERCROWDED", 8
+    elif rate_pct >= 0.01:
+        return "MILD_BULLISH_FUNDING", 4
+    else:
+        return "NEUTRAL", 0
 
 
 async def prefetch_funding_rates() -> None:
@@ -285,21 +294,7 @@ async def prefetch_funding_rates() -> None:
                         data = await resp.json()
                         rate = float(data.get("lastFundingRate", 0))
                         rate_pct = round(rate * 100, 4)
-                        if rate_pct <= -0.05:
-                            signal = "SHORTS_OVERCROWDED"
-                            score_bonus = 8
-                        elif rate_pct <= -0.01:
-                            signal = "MILD_BEARISH_FUNDING"
-                            score_bonus = 4
-                        elif rate_pct >= 0.05:
-                            signal = "LONGS_OVERCROWDED"
-                            score_bonus = 8
-                        elif rate_pct >= 0.01:
-                            signal = "MILD_BULLISH_FUNDING"
-                            score_bonus = 4
-                        else:
-                            signal = "NEUTRAL"
-                            score_bonus = 0
+                        signal, score_bonus = _classify_funding_rate(rate_pct)
                         _funding_cache[symbol] = {
                             "data": {
                                 "symbol": symbol,
