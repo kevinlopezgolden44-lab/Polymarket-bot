@@ -34,6 +34,22 @@ def detect_category(question):
     """
     q = question.lower()
 
+    # ── Early Politics detection for crypto-mentioning political markets ────────
+    # Must run BEFORE crypto detection to catch markets like:
+    # "Will Trump say Crypto this week?" — political market, not crypto price
+    # These contain crypto keywords but are fundamentally political questions.
+    _strong_political = [
+        "will trump say", "will biden say", "will trump mention",
+        "will the president say", "will trump tweet", "will trump post",
+        "trump executive order", "trump sign", "trump announce",
+        "will congress pass", "will senate pass", "will the fed chair",
+        "diplomatic", "ceasefire", "peace deal", "invasion of",
+        "war in ukraine", "war in russia", "nato summit",
+        "us-iran", "us-china", "us-russia", "us-north korea",
+    ]
+    if any(p in q for p in _strong_political):
+        return "Politics"
+
     # ── Crypto detection ──────────────────────────────────────────────────────
     # Long-form names: safe as substring match (unlikely to appear in other context)
     crypto_explicit = [
@@ -41,7 +57,8 @@ def detect_category(question):
         "solana", "xrp", "ripple",
         # Additional coins common on Polymarket
         "dogecoin", "doge", "pepe", "avax",  # removed "avalanche" — also an NHL team, use "avax" ticker only
-        "polygon", "matic", "shiba", "shib", "chainlink",
+        "polygon", "shiba", "shib", "chainlink",
+        # "matic" removed — matches "diplomatic", "automatic" etc. Use word boundary below.
         "binance coin", "bnb coin", "uniswap", "litecoin",
         "cardano", "polkadot",
         # "ada" and "dot" removed — match inside common words (Rivadavia, Granada, adopted)
@@ -54,7 +71,7 @@ def detect_category(question):
     # "ada" matches "Rivadavia", "Granada", "Canada"
     # "dot" matches "adopted", "endothermic"
     # "dai" matches "daily", "median"
-    if re.search(r'\b(eth|sol|bnb|link|ada|dot|dai)\b', q):
+    if re.search(r'\b(eth|sol|bnb|link|ada|dot|dai|matic)\b', q):
         return "Crypto"
 
     # ── Sports detection ──────────────────────────────────────────────────────
