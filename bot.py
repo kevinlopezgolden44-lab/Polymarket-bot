@@ -310,7 +310,7 @@ def _should_skip_market(question_lower):
 
 async def main():
     log.info("=" * 50)
-    log.info("Polymarket Bot v17 Starting...")
+    log.info("Polymarket Bot v18 Starting...")
     log.info("Change: Word count market skip filter added")
     log.info("Change: Cross-market consistency extended to threshold markets")
     log.info("=" * 50)
@@ -337,7 +337,7 @@ async def main():
 
     await send_message(
         TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-        "<b>Polymarket Bot v17 Started!</b>\n\n"
+        "<b>Polymarket Bot v18 Started!</b>\n\n"
         "Changes in this version:\n"
         "• CLOB order book now fetched for ALL categories (was Crypto only)\n"
         "• Price history tracked for all scored markets (better first-alert data)\n"

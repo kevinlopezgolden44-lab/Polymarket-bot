@@ -158,7 +158,8 @@ async def init_db(conn):
             edge_pct FLOAT,
             vegas_gap FLOAT,
             vegas_implied FLOAT,
-            spread FLOAT
+            spread FLOAT,
+            bot_version TEXT DEFAULT 'v17'
         )
     """)
 
@@ -247,7 +248,8 @@ async def init_db(conn):
             fear_greed_score INTEGER,
             fear_greed_regime TEXT,
             market_age_hours FLOAT,
-            category TEXT
+            category TEXT,
+            bot_version TEXT DEFAULT 'v17'
         )
     """)
 
@@ -345,6 +347,7 @@ async def init_db(conn):
         ("vegas_gap", "FLOAT"),
         ("vegas_implied", "FLOAT"),
         ("spread", "FLOAT"),
+        ("bot_version", "TEXT"),
         ("suppressed", "BOOLEAN"),
         ("suppression_reason", "TEXT"),
         ("ob_imbalance", "FLOAT"),
@@ -453,10 +456,10 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
                            direction, edge_pct, vegas_gap, vegas_implied, spread,
                            suppressed, suppression_reason,
                            ob_imbalance, ob_signal, volume_delta, volume_delta_signal,
-                           market_direction, volume_at_entry)
+                           market_direction, volume_at_entry, bot_version)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                 $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)
+                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -491,6 +494,7 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         opportunity.get("volume_delta_signal"),
         opportunity.get("signals", {}).get("market_direction"),
         opportunity.get("volume"),
+        "v18",
     )
 
     await conn.execute("""
@@ -515,12 +519,13 @@ async def log_opportunity(conn, opportunity, fear_greed=None, market_age=None):
     await conn.execute("""
         INSERT INTO opportunities_log (market_id, question, yes_price, score, reason,
                                       volume, logged_at, fear_greed_score, fear_greed_regime,
-                                      market_age_hours, category)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                                      market_age_hours, category, bot_version)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
         opportunity["score"], opportunity["reason"], opportunity["volume"], now(),
-        fg_score, fg_regime, market_age, opportunity.get("category", "General")
+        fg_score, fg_regime, market_age, opportunity.get("category", "General"),
+        "v18",
     )
 
 

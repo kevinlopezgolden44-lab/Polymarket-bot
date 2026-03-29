@@ -13,6 +13,8 @@ import argparse
 from datetime import datetime
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+BOT_VERSION  = "v18"   # Only analyse clean data from this version forward
+# Set to None to include all historical data
 
 # Outcome mappings
 WIN  = "TAKE_PROFIT"
