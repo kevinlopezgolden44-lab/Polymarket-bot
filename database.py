@@ -960,7 +960,7 @@ async def run_weekly_backtest(conn):
                hour_of_day_utc, loss_reason, actual_hold_days
         FROM alerts
         WHERE outcome IS NOT NULL
-        AND alerted_at > NOW() - INTERVAL '90 days'
+          AND COALESCE(bot_version, 'v17') = '""" + BOT_VERSION + """'
     """)
 
     if not rows:
@@ -1087,7 +1087,7 @@ async def run_weekly_backtest(conn):
     sig_section = sig_lines if sig_lines else ["  No signal data yet"]
 
     lines = [
-        "📊 <b>Weekly Backtest Report</b>",
+        f"📊 <b>Weekly Backtest Report — {BOT_VERSION}</b>",
         "",
         f"<b>Overall ({total} closed trades)</b>",
         f"Win Rate: {win_rate}%",
