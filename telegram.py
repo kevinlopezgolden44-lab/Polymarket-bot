@@ -4,6 +4,8 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
+from database import BOT_VERSION  # v18 clean data fork — defined in database.py
+
 def now():
     return datetime.utcnow()
 
@@ -166,9 +168,9 @@ async def send_alert(token, chat_id, opp, alert_id, research, limits):
 async def send_status(token, chat_id, conn):
     from database import get_risk_state, get_dynamic_limits, get_daily_stats
     try:
-        resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
-        total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
-        total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+        resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+        total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+        total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
         open_positions = await conn.fetchval(
             "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
         )
@@ -219,8 +221,8 @@ async def send_status(token, chat_id, conn):
         fear_win = round(sum(1 for a in fear_res if a["profitable"]) / len(fear_res) * 100) if fear_res else 0
         greed_win = round(sum(1 for a in greed_res if a["profitable"]) / len(greed_res) * 100) if greed_res else 0
 
-        agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL")
-        disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL")
+        agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+        disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
         agreed_win = round(sum(1 for a in agreed if a["profitable"]) / len(agreed) * 100) if agreed else 0
         disagreed_win = round(sum(1 for a in disagreed if a["profitable"]) / len(disagreed) * 100) if disagreed else 0
 
@@ -290,12 +292,12 @@ async def send_status(token, chat_id, conn):
 async def send_daily_summary(token, chat_id, conn):
     from database import get_risk_state, get_dynamic_limits, get_daily_stats
     alerts_today = await get_daily_stats(conn)
-    total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
-    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
+    total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     open_positions = await conn.fetchval(
         "SELECT COUNT(*) FROM trade_positions WHERE is_open = TRUE"
     )
-    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
+    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     profitable_count = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
 
@@ -315,8 +317,8 @@ async def send_daily_summary(token, chat_id, conn):
     avg_today_return = round(sum(closed_today_returns) / len(closed_today_returns), 1) if closed_today_returns else 0
 
     avg_score = sum(a["score"] for a in alerts_today) / len(alerts_today) if alerts_today else 0
-    agreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='agree'") or 0
-    disagreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='disagree'") or 0
+    agreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='agree' AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'") or 0
+    disagreed = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE user_rating='disagree' AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'") or 0
     state = await get_risk_state(conn)
     limits = get_dynamic_limits(state)
 
@@ -384,9 +386,9 @@ async def send_daily_summary(token, chat_id, conn):
 
 async def send_heartbeat(token, chat_id, conn):
     from database import get_risk_state, get_dynamic_limits, get_daily_stats
-    total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+    total_count = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     alerts_today = await get_daily_stats(conn)
-    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
+    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     profitable_count = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable_count / len(resolved) * 100) if resolved else 0
     state = await get_risk_state(conn)
@@ -410,9 +412,9 @@ async def send_weekly_analysis(token, chat_id, conn):
     The deep signal/category backtest is handled separately
     by run_weekly_backtest() in database.py and sent right after this.
     """
-    total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
-    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log")
-    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL")
+    total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+    total_opps = await conn.fetchval("SELECT COUNT(*) FROM opportunities_log WHERE COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+    resolved = await conn.fetch("SELECT * FROM alerts WHERE outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     profitable = sum(1 for a in resolved if a["profitable"])
     win_rate = round(profitable / len(resolved) * 100) if resolved else 0
 
@@ -427,8 +429,8 @@ async def send_weekly_analysis(token, chat_id, conn):
     avg_return_str = (("+" if avg_return >= 0 else "") + str(avg_return) + "%") if avg_return is not None else "tracking soon"
     avg_peak_str = ("+" + str(avg_peak) + "%") if avg_peak is not None else "tracking soon"
 
-    agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL")
-    disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL")
+    agreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='agree' AND outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
+    disagreed = await conn.fetch("SELECT * FROM alerts WHERE user_rating='disagree' AND outcome IS NOT NULL AND COALESCE(bot_version,'v17') = '" + BOT_VERSION + "'")
     agreed_win = round(sum(1 for a in agreed if a["profitable"]) / len(agreed) * 100) if agreed else 0
     disagreed_win = round(sum(1 for a in disagreed if a["profitable"]) / len(disagreed) * 100) if disagreed else 0
 
