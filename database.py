@@ -5,6 +5,8 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
+BOT_VERSION = "v18"  # Clean data fork — all reports filter to this version
+
 def now():
     return datetime.utcnow()
 
@@ -359,7 +361,10 @@ async def init_db(conn):
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
-    for col, typedef in [("category", "TEXT")]:
+    for col, typedef in [
+        ("category", "TEXT"),
+        ("bot_version", "TEXT"),
+    ]:
         await conn.execute(f"ALTER TABLE opportunities_log ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
     await conn.execute("ALTER TABLE sentiment_history ADD COLUMN IF NOT EXISTS trend TEXT")
@@ -561,7 +566,9 @@ async def log_sentiment(conn, fear_greed):
 
 async def get_daily_stats(conn):
     return await conn.fetch("""
-        SELECT * FROM alerts WHERE alerted_at > NOW() - INTERVAL '24 hours'
+        SELECT * FROM alerts
+        WHERE alerted_at > NOW() - INTERVAL '24 hours'
+          AND COALESCE(bot_version, 'v17') = '""" + BOT_VERSION + """'
     """)
 
 
