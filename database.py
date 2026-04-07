@@ -5,8 +5,6 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-BOT_VERSION = "v18"  # Clean data fork — all reports filter to this version
-
 def now():
     return datetime.utcnow()
 
@@ -160,8 +158,7 @@ async def init_db(conn):
             edge_pct FLOAT,
             vegas_gap FLOAT,
             vegas_implied FLOAT,
-            spread FLOAT,
-            bot_version TEXT DEFAULT 'v17'
+            spread FLOAT
         )
     """)
 
@@ -250,8 +247,7 @@ async def init_db(conn):
             fear_greed_score INTEGER,
             fear_greed_regime TEXT,
             market_age_hours FLOAT,
-            category TEXT,
-            bot_version TEXT DEFAULT 'v17'
+            category TEXT
         )
     """)
 
@@ -349,7 +345,6 @@ async def init_db(conn):
         ("vegas_gap", "FLOAT"),
         ("vegas_implied", "FLOAT"),
         ("spread", "FLOAT"),
-        ("bot_version", "TEXT"),
         ("suppressed", "BOOLEAN"),
         ("suppression_reason", "TEXT"),
         ("ob_imbalance", "FLOAT"),
@@ -361,10 +356,7 @@ async def init_db(conn):
     ]:
         await conn.execute(f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
-    for col, typedef in [
-        ("category", "TEXT"),
-        ("bot_version", "TEXT"),
-    ]:
+    for col, typedef in [("category", "TEXT")]:
         await conn.execute(f"ALTER TABLE opportunities_log ADD COLUMN IF NOT EXISTS {col} {typedef}")
 
     await conn.execute("ALTER TABLE sentiment_history ADD COLUMN IF NOT EXISTS trend TEXT")
@@ -461,10 +453,10 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
                            direction, edge_pct, vegas_gap, vegas_implied, spread,
                            suppressed, suppression_reason,
                            ob_imbalance, ob_signal, volume_delta, volume_delta_signal,
-                           market_direction, volume_at_entry, bot_version)
+                           market_direction, volume_at_entry)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                 $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42)
+                $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)
         RETURNING id
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
@@ -499,7 +491,6 @@ async def log_alert(conn, opportunity, fear_greed=None, market_age=None):
         opportunity.get("volume_delta_signal"),
         opportunity.get("signals", {}).get("market_direction"),
         opportunity.get("volume"),
-        "v18",
     )
 
     await conn.execute("""
@@ -524,13 +515,12 @@ async def log_opportunity(conn, opportunity, fear_greed=None, market_age=None):
     await conn.execute("""
         INSERT INTO opportunities_log (market_id, question, yes_price, score, reason,
                                       volume, logged_at, fear_greed_score, fear_greed_regime,
-                                      market_age_hours, category, bot_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                                      market_age_hours, category)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     """,
         opportunity["id"], opportunity["question"], opportunity["yes_price"],
         opportunity["score"], opportunity["reason"], opportunity["volume"], now(),
-        fg_score, fg_regime, market_age, opportunity.get("category", "General"),
-        "v18",
+        fg_score, fg_regime, market_age, opportunity.get("category", "General")
     )
 
 
@@ -566,9 +556,7 @@ async def log_sentiment(conn, fear_greed):
 
 async def get_daily_stats(conn):
     return await conn.fetch("""
-        SELECT * FROM alerts
-        WHERE alerted_at > NOW() - INTERVAL '24 hours'
-          AND COALESCE(bot_version, 'v17') = '""" + BOT_VERSION + """'
+        SELECT * FROM alerts WHERE alerted_at > NOW() - INTERVAL '24 hours'
     """)
 
 
@@ -620,14 +608,24 @@ async def update_open_positions(pool):
         for pos in open_positions:
             try:
                 url = "https://gamma-api.polymarket.com/markets?id=" + str(pos["market_id"])
-                async with session.get(url, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        continue
-                    markets = await resp.json()
-                    if not markets:
-                        continue
-                    market = markets[0]
+                market = None
+                for _attempt in range(3):
+                    try:
+                        async with session.get(url, headers=headers,
+                                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status != 200:
+                                break
+                            markets = await resp.json()
+                            if markets:
+                                market = markets[0]
+                                break
+                    except Exception as _fetch_e:
+                        log.warning("Position fetch attempt %d failed for %s: %s",
+                                    _attempt+1, pos["market_id"], _fetch_e)
+                        if _attempt < 2:
+                            await asyncio.sleep(2)
+                if not market:
+                    continue
 
                     outcomes = market.get("outcomePrices", "[]")
                     if isinstance(outcomes, str):
@@ -775,7 +773,29 @@ async def update_open_positions(pool):
 
                 await asyncio.sleep(0.3)
             except Exception as e:
-                log.error("update_open_positions error: %s", e)
+                log.error("update_open_positions error for market %s: %s",
+                          pos.get("market_id", "unknown"), e)
+                import traceback
+                log.error("Traceback: %s", traceback.format_exc())
+                # Minimal fallback — write at least outcome and return
+                try:
+                    async with pool.acquire() as conn_fallback:
+                        fb_return = round(
+                            (float(pos.get("current_price") or pos.get("entry_price") or 0)
+                             - float(pos.get("entry_price") or 1))
+                            / float(pos.get("entry_price") or 1) * 100, 2
+                        ) if pos.get("entry_price") else None
+                        await conn_fallback.execute("""
+                            UPDATE alerts
+                            SET exit_return_pct = COALESCE(exit_return_pct, $1),
+                                profitable = COALESCE(profitable, $2)
+                            WHERE id = $3
+                              AND exit_return_pct IS NULL
+                        """, fb_return,
+                            (fb_return or 0) > 0,
+                            pos.get("alert_id"))
+                except Exception as fb_e:
+                    log.error("Fallback write also failed: %s", fb_e)
 
     return closed
 
@@ -960,7 +980,7 @@ async def run_weekly_backtest(conn):
                hour_of_day_utc, loss_reason, actual_hold_days
         FROM alerts
         WHERE outcome IS NOT NULL
-          AND COALESCE(bot_version, 'v17') = '""" + BOT_VERSION + """'
+        AND alerted_at > NOW() - INTERVAL '90 days'
     """)
 
     if not rows:
@@ -1087,7 +1107,7 @@ async def run_weekly_backtest(conn):
     sig_section = sig_lines if sig_lines else ["  No signal data yet"]
 
     lines = [
-        f"📊 <b>Weekly Backtest Report — {BOT_VERSION}</b>",
+        "📊 <b>Weekly Backtest Report</b>",
         "",
         f"<b>Overall ({total} closed trades)</b>",
         f"Win Rate: {win_rate}%",
