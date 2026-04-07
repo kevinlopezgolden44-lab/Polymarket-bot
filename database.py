@@ -5,6 +5,8 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
+BOT_VERSION = "v18"  # Clean data fork — all reports filter to this version
+
 def now():
     return datetime.utcnow()
 
